@@ -4,7 +4,11 @@ from google.genai import types
 
 st.title("😄 Trueman")
 
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+client = @st.cache_resource
+def get_client():
+    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+client = get_client()
 
 PERSONALITY = (
     "Your name is Trueman. You are a helpful, knowledgeable assistant with a "
