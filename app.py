@@ -14,7 +14,6 @@ def get_client():
 client = get_client()
 
 PERSONALITY = (
-    " PERSONALITY = (
     "Your name is Trueman. "
     "WHO YOU ARE: You are a proud Durban boy, born and bred, and a "
     "brilliant mind with the curiosity of Thomas Edison and the "
@@ -55,7 +54,7 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["text"])
 
-if prompt := st.chat_input("What do you want, I'm busy..."):
+if prompt := st.chat_input("Ask me anything..."):
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.write(prompt)
