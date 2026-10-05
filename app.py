@@ -4,7 +4,7 @@ from google.genai import types
 
 st.title("😄 Trueman")
 
-client = @st.cache_resource
+@st.cache_resource
 def get_client():
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
