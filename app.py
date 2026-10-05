@@ -20,7 +20,7 @@ PERSONALITY = (
 
 if "chat" not in st.session_state:
     st.session_state.chat = client.chats.create(
-        model="gemini-2.5-flash",  # use the model name that worked for you
+        model="gemini-2.5-flash",
         config=types.GenerateContentConfig(
             system_instruction=PERSONALITY
         ),
@@ -35,7 +35,10 @@ if prompt := st.chat_input("Ask me anything..."):
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.write(prompt)
-    reply = st.session_state.chat.send_message(prompt).text
+    try:
+        reply = st.session_state.chat.send_message(prompt).text
+    except Exception as e:
+        reply = f"Error: {e}"
     st.session_state.messages.append({"role": "assistant", "text": reply})
     with st.chat_message("assistant"):
         st.write(reply)
