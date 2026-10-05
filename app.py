@@ -35,12 +35,23 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.write(m["text"])
 
-if prompt := st.chat_input("Ask me anything..."):
+if prompt := st.chat_input("What do you want, I'm busy..."):
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    reply = st.session_state.chat.send_message 
+    reply = None
+    for attempt in range(5):
+        try:
+            reply = st.session_state.chat.send_message(prompt).text
+            break
+        except Exception as e:
+            if attempt < 4 and "503" in str(e):
+                time.sleep(2 * (attempt + 1))
+            else:
+                reply = f"Trueman is having a moment: {e}"
+                break
+
     st.session_state.messages.append({"role": "assistant", "text": reply})
     with st.chat_message("assistant"):
         st.write(reply)
