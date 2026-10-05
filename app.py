@@ -20,7 +20,7 @@ PERSONALITY = (
 
 if "chat" not in st.session_state:
     st.session_state.chat = client.chats.create(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         config=types.GenerateContentConfig(
             system_instruction=PERSONALITY
         ),
