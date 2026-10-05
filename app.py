@@ -40,18 +40,7 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("user"):
         st.write(prompt)
 
-    reply = None
-    for attempt in range(3):
-        try:
-            reply = st.session_state.chat.send_message(prompt).text
-            break
-        except Exception as e:
-            if attempt < 2 and "503" in str(e):
-                time.sleep(3)
-            else:
-                reply = f"Trueman is having a moment: {e}"
-                break
-
+    reply = st.session_state.chat.send_message 
     st.session_state.messages.append({"role": "assistant", "text": reply})
     with st.chat_message("assistant"):
         st.write(reply)
