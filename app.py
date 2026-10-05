@@ -35,7 +35,18 @@ if prompt := st.chat_input("Ask me anything..."):
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.write(prompt)
-    try:
+    try:import time
+    reply = None
+    for attempt in range(3):
+        try:
+            reply = st.session_state.chat.send_message(prompt).text
+            break
+        except Exception as e:
+            if attempt < 2 and "503" in str(e):
+                time.sleep(3)
+            else:
+                reply = f"Trueman is having a moment: {e}"
+                break
         reply = st.session_state.chat.send_message(prompt).text
     except Exception as e:
         reply = f"Error: {e}"
