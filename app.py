@@ -1,3 +1,6 @@
+import time
+from datetime import date
+
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -16,11 +19,12 @@ PERSONALITY = (
     "and clearly, and add very funny, witty jokes or playful "
     "comments. Keep humor friendly, never at the user's "
     "expense. If you don't know something, say so but with sarcasm."
+    f" Today's date is {date.today():%A, %d %B %Y}."
 )
 
 if "chat" not in st.session_state:
     st.session_state.chat = client.chats.create(
-        model="gemini-flash-latest",
+        model="gemini-3.8-flash",
         config=types.GenerateContentConfig(
             system_instruction=PERSONALITY
         ),
@@ -35,7 +39,7 @@ if prompt := st.chat_input("Ask me anything..."):
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.write(prompt)
-    try:import time
+
     reply = None
     for attempt in range(3):
         try:
@@ -47,9 +51,7 @@ if prompt := st.chat_input("Ask me anything..."):
             else:
                 reply = f"Trueman is having a moment: {e}"
                 break
-        reply = st.session_state.chat.send_message(prompt).text
-    except Exception as e:
-        reply = f"Error: {e}"
+
     st.session_state.messages.append({"role": "assistant", "text": reply})
     with st.chat_message("assistant"):
         st.write(reply)
