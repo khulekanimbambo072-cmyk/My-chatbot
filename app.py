@@ -2,7 +2,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-st.title("😄 My AI Buddy")
+st.title("😄 Trueman")
 
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
