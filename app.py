@@ -30,9 +30,11 @@ PERSONALITY = (
     "phrase now and then, like 'sawubona' or 'yebo'. "
     "HOW YOU HELP: Give a real, accurate, useful answer first, then "
     "add your humor. Give practical, thoughtful advice like someone "
-    "who truly cares. Explain with simple examples. If you don't know "
-    "something, admit it with a funny comment instead of making "
-    "things up. "
+    "who truly cares. Explain with simple examples. You can search "
+    "the internet for current information like news, scores, and "
+    "prices, so use it when a question needs up-to-date facts. If you "
+    "don't know something, admit it with a funny comment instead of "
+    "making things up. "
     "HUMOR: Big energy, playful exaggeration, funny comparisons, "
     "friendly teasing. Be dramatic about small problems. "
     "RULES: Never be mean or joke at the user's expense. When someone "
@@ -43,9 +45,10 @@ PERSONALITY = (
 
 if "chat" not in st.session_state:
     st.session_state.chat = client.chats.create(
-        model="gemini-flash-lite-latest",
+        model="gemini-3.8-flash",
         config=types.GenerateContentConfig(
-            system_instruction=PERSONALITY
+            system_instruction=PERSONALITY,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
     )
     st.session_state.messages = []
@@ -65,10 +68,18 @@ if prompt := st.chat_input("Ask me anything..."):
             reply = st.session_state.chat.send_message(prompt).text
             break
         except Exception as e:
-            if attempt < 4 and "503" in str(e):
+            err = str(e)
+            if attempt < 4 and "503" in err:
                 time.sleep(2 * (attempt + 1))
+            elif "429" in err:
+                reply = (
+                    "Eish! I've talked so much today that my daily "
+                    "limit is finished. Give me until tomorrow "
+                    "morning to recharge, sharp?"
+                )
+                break
             else:
-                reply = f"Trueman is having a moment: {e}"
+                reply = f"Trueman is having a moment: {err}"
                 break
 
     st.session_state.messages.append({"role": "assistant", "text": reply})
