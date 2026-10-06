@@ -1,3 +1,4 @@
+import re
 import time
 
 import streamlit as st
@@ -40,6 +41,13 @@ def build_config(use_search):
     )
 
 
+def short_reason(err):
+    found = re.search(r"'quotaId': '([^']+)'", err)
+    if found:
+        return found.group(1)
+    return err[:80]
+
+
 def ask_trueman(messages):
     contents = [
         types.Content(
@@ -50,10 +58,10 @@ def ask_trueman(messages):
         if not m.get("error")
     ]
     use_search = st.session_state.get("use_search", True)
-    last_err = ""
+    tried = []
 
     for model in MODELS:
-        for attempt in range(4):
+        for attempt in range(2):
             try:
                 resp = client.models.generate_content(
                     model=model,
@@ -64,24 +72,20 @@ def ask_trueman(messages):
                 return text, True
             except Exception as e:
                 err = str(e)
-                last_err = err
                 low = err.lower()
-                if use_search and (
-                    "grounding" in low
-                    or "google_search" in low
-                    or "tool" in low
-                ):
+                if use_search and "grounding" in low:
                     use_search = False
                     st.session_state.use_search = False
+                    tried.append(model + ": search limit, search off")
                     continue
-                if "PerDay" in err or "404" in err:
-                    break
-                if ("503" in err or "429" in err) and attempt < 3:
+                if "503" in err and attempt < 1:
                     time.sleep(3)
                     continue
+                tried.append(model + ": " + short_reason(err))
                 break
 
-    return OUT_OF_ENERGY + "\n\n(debug: " + last_err[:300] + ")", False
+    debug = "\n".join(tried)
+    return OUT_OF_ENERGY + "\n\n(debug:\n" + debug + ")", False
 
 
 if "messages" not in st.session_state:
