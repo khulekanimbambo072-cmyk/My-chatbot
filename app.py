@@ -1,4 +1,3 @@
-import re
 import time
 
 import streamlit as st
@@ -8,6 +7,9 @@ from google.genai import types
 from personality import get_personality
 
 st.title("😄 Trueman")
+
+# Set to True to let Trueman use Google Search
+USE_SEARCH = False
 
 
 @st.cache_resource
@@ -21,7 +23,6 @@ MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
 ]
 
@@ -31,9 +32,9 @@ OUT_OF_ENERGY = (
 )
 
 
-def build_config(use_search):
+def build_config():
     tools = None
-    if use_search:
+    if USE_SEARCH:
         tools = [types.Tool(google_search=types.GoogleSearch())]
     return types.GenerateContentConfig(
         system_instruction=get_personality(),
@@ -42,10 +43,10 @@ def build_config(use_search):
 
 
 def short_reason(err):
-    found = re.search(r"'quotaId': '([^']+)'", err)
-    if found:
-        return found.group(1)
-    return err[:80]
+    start = err.find("quota")
+    if start < 0:
+        start = 0
+    return err[start:start + 160]
 
 
 def ask_trueman(messages):
@@ -57,7 +58,6 @@ def ask_trueman(messages):
         for m in messages
         if not m.get("error")
     ]
-    use_search = st.session_state.get("use_search", True)
     tried = []
 
     for model in MODELS:
@@ -66,18 +66,12 @@ def ask_trueman(messages):
                 resp = client.models.generate_content(
                     model=model,
                     contents=contents,
-                    config=build_config(use_search),
+                    config=build_config(),
                 )
                 text = resp.text or "Yoh, I went blank. Ask me again?"
                 return text, True
             except Exception as e:
                 err = str(e)
-                low = err.lower()
-                if use_search and "grounding" in low:
-                    use_search = False
-                    st.session_state.use_search = False
-                    tried.append(model + ": search limit, search off")
-                    continue
                 if "503" in err and attempt < 1:
                     time.sleep(3)
                     continue
