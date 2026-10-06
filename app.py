@@ -50,6 +50,7 @@ def ask_trueman(messages):
         if not m.get("error")
     ]
     use_search = st.session_state.get("use_search", True)
+    last_err = ""
 
     for model in MODELS:
         for attempt in range(4):
@@ -63,6 +64,7 @@ def ask_trueman(messages):
                 return text, True
             except Exception as e:
                 err = str(e)
+                last_err = err
                 low = err.lower()
                 if use_search and (
                     "grounding" in low
@@ -75,11 +77,11 @@ def ask_trueman(messages):
                 if "PerDay" in err or "404" in err:
                     break
                 if ("503" in err or "429" in err) and attempt < 3:
-                    time.sleep(5 * (attempt + 1))
+                    time.sleep(3)
                     continue
                 break
 
-    return OUT_OF_ENERGY, False
+    return OUT_OF_ENERGY + "\n\n(debug: " + last_err[:300] + ")", False
 
 
 if "messages" not in st.session_state:
@@ -94,7 +96,8 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("user"):
         st.write(prompt)
 
-    reply, ok = ask_trueman(st.session_state.messages)
+    with st.spinner("Trueman is thinking..."):
+        reply, ok = ask_trueman(st.session_state.messages)
 
     st.session_state.messages.append(
         {"role": "assistant", "text": reply, "error": not ok}
