@@ -1,4 +1,4 @@
-"""Trueman: one-page Streamlit chatbot (personality + seamless fallback upgrades)."""
+"""Trueman: one-page Streamlit chatbot (personality + upgrades merged)."""
 from __future__ import annotations
 
 import hashlib
@@ -52,22 +52,13 @@ MAX_ATTEMPTS_PER_MODEL = 2
 QUOTA_COOLDOWN_SECONDS = 90
 SHARE_TTL_SECONDS = 7 * 24 * 60 * 60
 
-# Expanded multi-tier list for seamless fallback across model generations
-MODELS = list(
-    dict.fromkeys(
-        [
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.5-pro",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro",
-            "gemini-flash-lite-latest",
-            "gemini-flash-latest",
-        ]
-    )
-)
+# Production-ready Gemini models
+MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
 
 SUGGESTIONS = [
     "Explain black holes like I'm 10",
@@ -530,7 +521,7 @@ def build_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
     return contents
 
 
-# ---------------- Streaming Response with Seamless Fallback ----------------
+# ---------------- Streaming Response ----------------
 def stream_trueman(
     messages: list[dict[str, Any]],
     result: dict[str, Any],
@@ -590,14 +581,12 @@ def stream_trueman(
                     result["tokens"] = current_request_tokens
                     return
 
-                # If no text was yielded, mark model as empty and fallback seamlessly
                 tried.append(f"{model}: empty response")
                 break
 
             except Exception as e:
                 error = str(e)
 
-                # Mid-stream failure: part of output is already rendered
                 if yielded_text:
                     result["ok"] = True
                     result["model"] = model
@@ -612,7 +601,6 @@ def stream_trueman(
                     saw_quota_error = True
                     cooldown_model(model, QUOTA_COOLDOWN_SECONDS)
                     tried.append(f"{model}: {short_reason(error)}")
-                    # Seamlessly hop to next model
                     break
 
                 if should_retry(e) and attempt < MAX_ATTEMPTS_PER_MODEL - 1:
@@ -955,221 +943,4 @@ def render_attachment(attachment: dict[str, Any]) -> None:
 
     if attachment.get("kind") == "image" and data:
         st.image(data, caption=label)
-    elif attachment.get("kind") == "audio" and data:
-        st.audio(data, format=attachment.get("mime_type", "audio/wav"))
-    elif extracted_text:
-        st.caption(f"{label} — {len(extracted_text):,} characters extracted")
-    else:
-        st.caption(label)
-
-
-def render_speaker(text: str) -> None:
-    components.html(
-        """
-        <script>
-            const message = %s;
-            if ("speechSynthesis" in window) {
-                window.speechSynthesis.cancel();
-                const utterance = new SpeechSynthesisUtterance(message);
-                utterance.rate = 1;
-                utterance.pitch = 1;
-                window.speechSynthesis.speak(utterance);
-            }
-        </script>
-        """
-        % json.dumps(text),
-        height=1,
-    )
-
-
-# ---------------- Formatting & Sharing ----------------
-def format_chat_title(prompt: str) -> str:
-    title = " ".join(prompt.split())
-    title = truncate_text(title, 52)
-    if not title:
-        return "New chat"
-    return title[0].upper() + title[1:]
-
-
-def serialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    serialized = []
-    for message in messages:
-        if message.get("error"):
-            continue
-
-        item = {
-            "role": message.get("role", "user"),
-            "text": message.get("text", ""),
-            "model": message.get("model"),
-            "tokens": message.get("tokens"),
-        }
-
-        attachment = message.get("attachment")
-        if attachment:
-            item["attachment"] = {
-                "name": attachment.get("name"),
-                "kind": attachment.get("kind"),
-            }
-
-        serialized.append(item)
-
-    return serialized
-
-
-def build_markdown_export(messages: list[dict[str, Any]]) -> str:
-    lines = [
-        f"# {st.session_state.get('chat_title') or 'Trueman Chat'}",
-        "",
-        f"Exported: {date.today():%Y-%m-%d}",
-        "",
-    ]
-
-    for message in messages:
-        if message.get("error"):
-            continue
-
-        speaker = "User" if message.get("role") == "user" else "Trueman"
-        lines.append(f"## {speaker}")
-        lines.append("")
-        lines.append(message.get("text", ""))
-        lines.append("")
-
-        attachment = message.get("attachment")
-        if attachment:
-            lines.append(f"> Attachment: {attachment_label(attachment)}")
-            lines.append("")
-
-    return "\n".join(lines).strip() + "\n"
-
-
-SHARE_DIR = Path(tempfile.gettempdir()) / "trueman_shared_chats"
-SHARE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
-
-
-def share_path(share_id: str) -> Path | None:
-    if not SHARE_ID_PATTERN.fullmatch(share_id or ""):
-        return None
-    return SHARE_DIR / f"{share_id}.json"
-
-
-def purge_expired_shares() -> None:
-    if not SHARE_DIR.exists():
-        return
-
-    now = time.time()
-    for path in SHARE_DIR.glob("*.json"):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            if record.get("expires_at", 0) < now:
-                path.unlink(missing_ok=True)
-        except Exception:
-            path.unlink(missing_ok=True)
-
-
-def save_shared_chat(messages: list[dict[str, Any]], title: str) -> str:
-    SHARE_DIR.mkdir(parents=True, exist_ok=True)
-    purge_expired_shares()
-
-    share_id = secrets.token_urlsafe(32)
-    now = time.time()
-    record = {
-        "id": share_id,
-        "title": truncate_text(title or "Trueman chat", 80),
-        "messages": serialize_messages(messages),
-        "created_at": now,
-        "expires_at": now + SHARE_TTL_SECONDS,
-    }
-
-    path = share_path(share_id)
-    if path:
-        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    return share_id
-
-
-def load_shared_chat(share_id: str) -> dict[str, Any] | None:
-    path = share_path(share_id)
-    if path is None or not path.exists():
-        return None
-
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    if record.get("expires_at", 0) < time.time():
-        path.unlink(missing_ok=True)
-        return None
-
-    cleaned = []
-    for message in record.get("messages", []):
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        text = str(message.get("text", ""))
-        if role not in {"user", "assistant"} or not text:
-            continue
-        cleaned.append(
-            {
-                "role": role,
-                "text": text,
-                "model": message.get("model"),
-                "tokens": message.get("tokens"),
-            }
-        )
-
-    return {"title": str(record.get("title", "Shared chat")), "messages": cleaned}
-
-
-def revoke_shared_chat(share_id: str) -> None:
-    path = share_path(share_id)
-    if path is not None:
-        path.unlink(missing_ok=True)
-
-
-# ---------------- Response Runner ----------------
-def run_trueman(
-    chaos: int,
-    learning_mode: str,
-    memory_context: str,
-    generate_followups_enabled: bool = True,
-) -> None:
-    request_id = new_request_id()
-    started = time.perf_counter()
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "model": None,
-        "tokens": 0,
-        "quota": False,
-        "retries": 0,
-        "error_details": [],
-    }
-
-    with st.chat_message("assistant"):
-        with st.spinner("Trueman is thinking..."):
-            reply = st.write_stream(
-                stream_trueman(
-                    st.session_state.messages,
-                    result,
-                    chaos=chaos,
-                    learning_mode=learning_mode,
-                    memory_context=memory_context,
-                )
-            )
-
-    if not isinstance(reply, str):
-        reply = "".join(str(part) for part in (reply or []))
-
-    message = ChatMessage(
-        role="assistant",
-        text=reply,
-        error=not result["ok"],
-        retryable=not result["ok"],
-        model=result["model"],
-        tokens=result["tokens"],
-        followups=[],
-    ).to_dict()
-
-    st.session_state.messages.append(message)
-
-    elapsed = time.perf
+    elif attachment.get("kind
