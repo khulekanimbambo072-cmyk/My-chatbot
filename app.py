@@ -53,6 +53,7 @@ MAX_ATTEMPTS_PER_MODEL = 3
 QUOTA_COOLDOWN_SECONDS = 90
 SHARE_TTL_SECONDS = 7 * 24 * 60 * 60
 
+# Model list preserved exactly as requested
 MODELS = list(
     dict.fromkeys(
         [
@@ -609,6 +610,7 @@ def stream_trueman(
                         )
                         current_request_tokens = reported_tokens
 
+                    # Exception-safe chunk.text extraction
                     try:
                         text = chunk.text or ""
                     except Exception:
@@ -1143,7 +1145,8 @@ def save_shared_chat(messages: list[dict[str, Any]], title: str) -> str:
     }
 
     path = share_path(share_id)
-    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    if path:
+        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
     return share_id
 
 
@@ -1254,9 +1257,6 @@ def run_trueman(
         )
 
         if generate_followups_enabled and user_message:
-            # Save quota: only ask the model for follow-ups on substantial
-            # answers while we still have spare models. Otherwise use the
-            # free local suggestions.
             use_model = len(reply) >= 200 and len(available_models()) >= 2
             message["followups"] = generate_followups(
                 user_message.get("text", ""),
@@ -1407,7 +1407,6 @@ def import_shared_chat_callback() -> None:
 
 
 def dismiss_shared_chat_callback() -> None:
-    # Prevent the same link from prompting again on every rerun.
     st.session_state.shared_chat_payload = {"dismissed": True}
     try:
         del st.query_params["share"]
@@ -1517,6 +1516,8 @@ def submit_user_message(prompt: str) -> None:
 
     st.session_state.last_send_time = time.time()
     st.session_state.run_pending = True
+
+    # Drop binary attachment memory immediately after submission
     clear_pending_attachment()
     st.rerun()
 
@@ -1760,259 +1761,4 @@ with st.sidebar:
         )
         st.download_button(
             "⬇️ Export chat (Markdown)",
-            data=build_markdown_export(st.session_state.messages),
-            file_name=f"{export_name}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
-    with st.expander("🔗 Share chat", expanded=False):
-        st.caption(
-            "Creates a private link with a random ID. The chat is stored "
-            "on the server for 7 days and you can revoke it any time. "
-            "Attachments are never shared, and links stop working if the "
-            "app restarts."
-        )
-
-        if st.button(
-            "Create share link",
-            key="create_share_link",
-            use_container_width=True,
-            disabled=not st.session_state.messages,
-        ):
-            try:
-                new_share_id = save_shared_chat(
-                    st.session_state.messages,
-                    st.session_state.chat_title,
-                )
-                st.session_state.share_ids.append(new_share_id)
-            except Exception as e:
-                st.error(f"Couldn't create the share link: {e}")
-
-        for share_id in list(st.session_state.share_ids):
-            st.code(f"{APP_URL}/?share={share_id}", language=None)
-            if st.button(
-                "Revoke this link",
-                key=f"revoke_{share_id}",
-                use_container_width=True,
-            ):
-                revoke_shared_chat(share_id)
-                st.session_state.share_ids.remove(share_id)
-                st.rerun()
-
-    with st.expander("📈 Performance", expanded=False):
-        log = st.session_state.telemetry
-        if log:
-            last = log[-1]
-            average = sum(item["elapsed"] for item in log) / len(log)
-            failed = sum(1 for item in log if not item["ok"])
-            st.caption(
-                f"Last: {last['elapsed']:.2f}s · "
-                f"{last['model'] or 'no model'} · "
-                f"retries {last['retries']}"
-            )
-            st.caption(
-                f"Average {average:.2f}s over {len(log)} requests · "
-                f"{failed} failed"
-            )
-        else:
-            st.caption("No requests yet.")
-
-        cooling = [m for m in MODELS if m not in available_models()]
-        if cooling:
-            st.caption("Cooling down: " + ", ".join(cooling))
-
-
-# ---------------- Shared chat banner ----------------
-shared = st.session_state.shared_chat_payload
-
-if shared and shared.get("expired"):
-    st.warning("That shared chat link has expired or was revoked.")
-    st.button("Dismiss", key="dismiss_expired", on_click=dismiss_shared_chat_callback)
-elif shared and "messages" in shared:
-    st.info(
-        f"💬 Shared chat: **{shared.get('title', 'Shared chat')}** "
-        f"({len(shared['messages'])} messages, read-only preview)"
-    )
-    with st.expander("Preview"):
-        for shared_message in shared["messages"]:
-            who = "You" if shared_message["role"] == "user" else "Trueman"
-            st.markdown(f"**{who}:** {shared_message['text']}")
-    st.button(
-        "Import as my chat (replaces the current chat)",
-        key="import_shared_chat",
-        use_container_width=True,
-        on_click=import_shared_chat_callback,
-    )
-    st.button(
-        "Dismiss",
-        key="dismiss_shared_chat",
-        use_container_width=True,
-        on_click=dismiss_shared_chat_callback,
-    )
-
-
-# ---------------- Chat history ----------------
-messages = st.session_state.messages
-
-if not messages:
-    st.write("Howzit! Ask me anything, or pick a starter:")
-    for suggestion_index, suggestion in enumerate(SUGGESTIONS):
-        st.button(
-            suggestion,
-            key=f"suggestion_{suggestion_index}",
-            use_container_width=True,
-            on_click=queue_prompt_callback,
-            args=(suggestion,),
-        )
-
-last_index = len(messages) - 1
-last_user_index = max(
-    (i for i, m in enumerate(messages) if m.get("role") == "user"),
-    default=-1,
-)
-
-for index, message in enumerate(messages):
-    role = message.get("role", "user")
-
-    with st.chat_message("user" if role == "user" else "assistant"):
-        attachment = message.get("attachment")
-        if attachment:
-            render_attachment(attachment)
-
-        editing = (
-            role == "user"
-            and st.session_state.edit_message_index == index
-        )
-
-        if editing:
-            st.text_area(
-                "Edit your message",
-                value=message.get("text", ""),
-                key=f"edit_text_{st.session_state.edit_widget_version}",
-                height=120,
-            )
-            st.button(
-                "Save and resend",
-                key=f"save_edit_{index}",
-                use_container_width=True,
-                on_click=save_edit_callback,
-                args=(index,),
-            )
-            st.button(
-                "Cancel",
-                key=f"cancel_edit_{index}",
-                use_container_width=True,
-                on_click=cancel_edit_callback,
-            )
-        elif message.get("error"):
-            st.error(message.get("text", SOMETHING_BROKE))
-
-            if message.get("retryable"):
-                wait = cooldown_remaining()
-                if wait:
-                    st.caption(f"⏳ My models recharge in about {wait}s.")
-                st.button(
-                    "🔄 Retry",
-                    key=f"retry_failed_{index}",
-                    disabled=wait > 0,
-                    on_click=retry_failed_callback,
-                    args=(index,),
-                )
-        else:
-            st.markdown(message.get("text", ""))
-
-        if role == "user" and index == last_user_index and not editing:
-            if not st.session_state.run_pending:
-                st.button(
-                    "✏️ Edit",
-                    key=f"edit_{index}",
-                    on_click=start_edit_callback,
-                    args=(index,),
-                )
-
-        if role == "assistant" and not message.get("error"):
-            if DEBUG and message.get("model"):
-                st.caption(
-                    f"{message['model']} · {message.get('tokens', 0)} tokens"
-                )
-
-            feedback = message.get("feedback")
-            label = "⋯" if feedback is None else ("👍" if feedback == 1 else "👎")
-
-            with st.popover(label):
-                st.button(
-                    "👍 Good answer",
-                    key=f"like_{index}",
-                    use_container_width=True,
-                    on_click=set_feedback_callback,
-                    args=(index, 1),
-                )
-                st.button(
-                    "👎 Bad answer",
-                    key=f"dislike_{index}",
-                    use_container_width=True,
-                    on_click=set_feedback_callback,
-                    args=(index, -1),
-                )
-                st.button(
-                    "🔊 Read aloud",
-                    key=f"speak_{index}",
-                    use_container_width=True,
-                    on_click=speak_callback,
-                    args=(index,),
-                )
-                if index == last_index:
-                    st.button(
-                        "🔄 Regenerate",
-                        key=f"regenerate_{index}",
-                        use_container_width=True,
-                        on_click=regenerate_callback,
-                    )
-
-            if index == last_index and not st.session_state.run_pending:
-                for followup_index, followup in enumerate(
-                    message.get("followups") or []
-                ):
-                    st.button(
-                        followup,
-                        key=f"followup_{index}_{followup_index}",
-                        use_container_width=True,
-                        on_click=queue_prompt_callback,
-                        args=(followup,),
-                    )
-
-if st.session_state.speak_message_index is not None:
-    speak_index = st.session_state.speak_message_index
-    st.session_state.speak_message_index = None
-    if 0 <= speak_index < len(messages):
-        render_speaker(messages[speak_index].get("text", ""))
-
-
-# ---------------- Generate a pending reply ----------------
-if st.session_state.run_pending:
-    st.session_state.run_pending = False
-
-    if messages and messages[-1].get("role") == "user":
-        run_trueman(
-            chaos=chaos,
-            learning_mode=learning_mode,
-            memory_context=memory_context,
-            generate_followups_enabled=st.session_state.generate_followups,
-        )
-        st.rerun()
-
-
-# ---------------- Input ----------------
-if st.session_state.force_send_attachment:
-    st.session_state.force_send_attachment = False
-    submit_user_message("")
-
-queued_prompt = st.session_state.queued_prompt
-if queued_prompt:
-    st.session_state.queued_prompt = None
-    submit_user_message(queued_prompt)
-
-typed_prompt = st.chat_input("Ask Trueman anything...")
-if typed_prompt:
-    submit_user_message(typed_prompt)
+            data=build_markdown_export(st.session_
