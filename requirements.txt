@@ -1,3 +1,10 @@
 streamlit 
 google-genai
 reportlab>=4.0.0
+# Linux/macOS
+source venv/bin/activate
+pip install reportlab
+
+# Windows
+venv\Scripts\activate
+pip install reportlab
