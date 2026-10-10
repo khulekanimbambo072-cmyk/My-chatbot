@@ -1,4 +1,4 @@
-"""Trueman: Supercharged Streamlit Chatbot with Search, Code Execution & Custom Voice."""
+"""Trueman: Supercharged Streamlit Chatbot with Safe Tool Configuration."""
 from __future__ import annotations
 
 import hashlib
@@ -34,9 +34,9 @@ st.title("😄 Trueman")
 
 
 # ---------------- Settings ----------------
-USE_SEARCH = True        # Enable live web search grounding
-USE_CODE_EXEC = True     # Enable native Python code execution tool
-DEBUG = False
+USE_SEARCH = False       # Safely disabled by default to prevent model tool errors
+USE_CODE_EXEC = False    # Safely disabled by default to prevent sandbox initialization crashes
+DEBUG = True             # Enabled temporarily so any backend errors show on screen instead of blanking out
 
 APP_URL = "https://50trueman.streamlit.app"
 
@@ -55,10 +55,8 @@ MAX_ATTEMPTS_PER_MODEL = 3
 QUOTA_COOLDOWN_SECONDS = 90
 SHARE_TTL_SECONDS = 7 * 24 * 60 * 60
 
-# Default ElevenLabs Voice ID (Replace with your custom cloned voice ID if desired)
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 
-# Model list preserved exactly as requested
 MODELS = list(
     dict.fromkeys(
         [
@@ -71,10 +69,10 @@ MODELS = list(
 )
 
 SUGGESTIONS = [
-    "What are today's top news headlines in South Africa?",
-    "Write a Python script to calculate compound interest and run it",
     "Explain black holes like I'm 10",
-    "Teach me 5 useful Zulu phrases",
+    "Help me write a CV that slaps",
+    "Teach me 5 Zulu phrases",
+    "Is it ever okay to put pineapple on pizza?",
 ]
 
 LEARNING_MODES = {
@@ -156,7 +154,6 @@ RATE_LIMIT_ERRORS = (
 )
 
 
-# ---------------- Typed message model ----------------
 Role = Literal["user", "assistant"]
 
 
@@ -176,7 +173,6 @@ class ChatMessage:
         return asdict(self)
 
 
-# ---------------- Personality ----------------
 def chaos_instruction(level: int) -> str:
     if level <= 3:
         return (
@@ -184,14 +180,12 @@ def chaos_instruction(level: int) -> str:
             "more focus - like a wise uncle sipping tea. Still warm, "
             "just softer."
         )
-
     if level >= 8:
         return (
             "ENERGY LEVEL: Maximum chaos! Be dramatic, exaggerate "
             "wildly, turn every answer into a performance - full braai "
             "energy, but never mean."
         )
-
     return (
         "ENERGY LEVEL: Your normal self - playful, warm, energetic, "
         "but sensible when it matters."
@@ -215,7 +209,6 @@ def build_memory_context(
     summary: str,
 ) -> str:
     lines = []
-
     if profile.get("name"):
         lines.append(f"Name: {profile['name']}")
     if profile.get("location"):
@@ -236,7 +229,7 @@ def build_memory_context(
 
 
 def get_personality(
-    can_search: bool = True,
+    can_search: bool = False,
     chaos: int = 6,
     learning_mode: str = "General",
     memory_context: str = "",
@@ -247,8 +240,7 @@ def get_personality(
         "brilliant mind with the curiosity of Thomas Edison and the "
         "insight of Albert Einstein. You can explain anything, from "
         "science to business to life problems, in a way anyone can "
-        "understand. You have full internet search capabilities and Python code execution capabilities. "
-        "You love to talk, you are energetic and a little "
+        "understand. You love to talk, you are energetic and a little "
         "chaotic, but always warm and friendly, like the favourite uncle "
         "or best friend everyone wants at the braai. "
         "LANGUAGE: English is your main language. Sprinkle in light "
@@ -260,7 +252,8 @@ def get_personality(
         "HOW YOU HELP: Give a real, accurate, useful answer first, then "
         "add your humor. Give practical, thoughtful advice like someone "
         "who truly cares. Explain with simple examples. If you don't "
-        "know something, use Google Search to verify facts instead of making things up. "
+        "know something, admit it with a funny comment instead of "
+        "making things up. "
         "HUMOR: Big energy, playful exaggeration, funny comparisons, "
         "friendly teasing. Be dramatic about small problems. "
         "RULES: Never be mean or joke at the user's expense. When "
@@ -285,12 +278,6 @@ def get_personality(
             "the memory directly unless it is useful. "
         )
 
-    if can_search:
-        text += (
-            "SEARCH & CODE: You can search the web for live information, "
-            "news, scores, and pricing, and execute Python code to solve math or data analysis. "
-        )
-
     text += f"Today's date is {date.today():%A, %d %B %Y}."
     return text
 
@@ -313,12 +300,6 @@ def build_config(
     learning_mode: str,
     memory_context: str,
 ) -> types.GenerateContentConfig:
-    tools = []
-    if USE_SEARCH:
-        tools.append(types.Tool(google_search=types.GoogleSearch()))
-    if USE_CODE_EXEC:
-        tools.append(types.Tool(code_execution=types.CodeExecution()))
-
     config_kwargs = {
         "system_instruction": get_personality(
             can_search=USE_SEARCH,
@@ -327,14 +308,9 @@ def build_config(
             memory_context=memory_context,
         )
     }
-
-    if tools:
-        config_kwargs["tools"] = tools
-
     return types.GenerateContentConfig(**config_kwargs)
 
 
-# ---------------- Errors, cooldowns and retries ----------------
 def is_quota_error(error: Exception | str) -> bool:
     text = str(error).lower()
     return any(marker in text for marker in RATE_LIMIT_ERRORS)
@@ -387,7 +363,6 @@ def note_failure(model: str, error: Exception) -> None:
         cooldown_model(model, QUOTA_COOLDOWN_SECONDS)
 
 
-# ---------------- Telemetry ----------------
 def new_request_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -411,7 +386,6 @@ def record_request(
     del log[:-50]
 
 
-# ---------------- Message and context helpers ----------------
 def message_size(message: dict[str, Any]) -> int:
     size = len(message.get("text", ""))
     attachment = message.get("attachment") or {}
@@ -535,7 +509,6 @@ def build_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
     return contents
 
 
-# ---------------- Main streaming ----------------
 def stream_trueman(
     messages: list[dict[str, Any]],
     result: dict[str, Any],
@@ -634,12 +607,11 @@ def stream_trueman(
     reply = OUT_OF_ENERGY if saw_quota_error else SOMETHING_BROKE
 
     if DEBUG:
-        reply += "\n\n(debug:\n" + "\n".join(tried) + ")"
+        reply += "\n\n(debug error trace:\n" + "\n".join(tried) + ")"
 
     yield reply
 
 
-# ---------------- Follow-up suggestions ----------------
 def fallback_followups(
     learning_mode: str,
     user_text: str,
@@ -653,14 +625,12 @@ def fallback_followups(
             "Give me a harder one",
             "Quiz me on the last answer",
         ]
-
     if learning_mode == "Flashcards":
         return [
             "Make more flashcards",
             "Test me with those cards",
             "Turn that into a summary",
         ]
-
     if learning_mode == "Tutor":
         return [
             "Continue the lesson",
@@ -717,7 +687,6 @@ def generate_followups(
 
             text = response.text or ""
             lines = []
-
             for line in text.splitlines():
                 cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
                 if cleaned:
@@ -733,7 +702,6 @@ def generate_followups(
     return fallback
 
 
-# ---------------- Memory and summaries ----------------
 def generate_chat_summary(messages: list[dict[str, Any]]) -> str:
     visible = [
         m for m in messages
@@ -820,7 +788,6 @@ def maybe_update_summary(messages: list[dict[str, Any]]) -> None:
     st.session_state.summary_next_at = len(visible) + SUMMARY_REFRESH_EVERY
 
 
-# ---------------- Attachments and voice ----------------
 def extract_pdf_text(file_bytes: bytes) -> str:
     reader_cls = None
     try:
@@ -968,9 +935,7 @@ def render_attachment(attachment: dict[str, Any]) -> None:
         st.caption(label)
 
 
-# ---------------- ElevenLabs Speech Synthesis ----------------
 def render_speaker(text: str) -> None:
-    """Generate and auto-play custom Trueman voice via ElevenLabs API."""
     api_key = st.secrets.get("ELEVENLABS_API_KEY")
 
     if not api_key:
@@ -1003,7 +968,6 @@ def render_speaker(text: str) -> None:
         st.error(f"Could not connect to ElevenLabs API: {e}")
 
 
-# ---------------- Titles and export ----------------
 def format_chat_title(prompt: str) -> str:
     title = " ".join(prompt.split())
     title = truncate_text(title, 52)
@@ -1063,7 +1027,6 @@ def build_markdown_export(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-# ---------------- Private share links (server-side, random ID) ----------------
 SHARE_DIR = Path(tempfile.gettempdir()) / "trueman_shared_chats"
 SHARE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 
@@ -1148,7 +1111,6 @@ def revoke_shared_chat(share_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
-# ---------------- Main response runner ----------------
 def run_trueman(
     chaos: int,
     learning_mode: str,
@@ -1226,7 +1188,6 @@ def run_trueman(
         maybe_update_summary(st.session_state.messages)
 
 
-# ---------------- Session state ----------------
 session_defaults = {
     "messages": [],
     "model_cooldowns": {},
@@ -1278,7 +1239,6 @@ if share_param and st.session_state.shared_chat_payload is None:
     )
 
 
-# ---------------- Callbacks ----------------
 def clear_pending_attachment() -> None:
     st.session_state.pending_attachment = None
     st.session_state.pending_attachment_key = ""
@@ -1376,4 +1336,595 @@ def queue_prompt_callback(prompt: str) -> None:
 
 
 def send_attachment_now_callback() -> None:
-    st
+    st.session_state.force_send_attachment = True
+
+
+def set_feedback_callback(index: int, value: int) -> None:
+    messages = st.session_state.messages
+    if 0 <= index < len(messages):
+        current = messages[index].get("feedback")
+        messages[index]["feedback"] = None if current == value else value
+
+
+def speak_callback(index: int) -> None:
+    st.session_state.speak_message_index = index
+
+
+def regenerate_callback() -> None:
+    messages = st.session_state.messages
+    if messages and messages[-1].get("role") == "assistant":
+        messages.pop()
+        st.session_state.run_pending = True
+
+
+def retry_failed_callback(index: int) -> None:
+    st.session_state.messages = st.session_state.messages[:index]
+    st.session_state.run_pending = True
+
+
+def start_edit_callback(index: int) -> None:
+    st.session_state.edit_message_index = index
+    st.session_state.edit_widget_version += 1
+
+
+def cancel_edit_callback() -> None:
+    st.session_state.edit_message_index = None
+
+
+def save_edit_callback(index: int) -> None:
+    version = st.session_state.edit_widget_version
+    new_text = st.session_state.get(f"edit_text_{version}", "").strip()
+    messages = st.session_state.messages
+
+    if not new_text or index >= len(messages):
+        st.session_state.edit_message_index = None
+        return
+
+    if len(new_text) > MAX_INPUT_CHARS:
+        st.toast(TOO_LONG)
+        return
+
+    original = messages[index]
+    st.session_state.messages = messages[:index] + [
+        ChatMessage(
+            role="user",
+            text=new_text,
+            attachment=original.get("attachment"),
+        ).to_dict()
+    ]
+    st.session_state.edit_message_index = None
+    st.session_state.conversation_summary = ""
+    st.session_state.summary_next_at = SUMMARY_TRIGGER_MESSAGES
+    st.session_state.run_pending = True
+
+
+def submit_user_message(prompt: str) -> None:
+    prompt = prompt.strip()
+    attachment = st.session_state.pending_attachment
+
+    if not prompt and attachment:
+        prompt = default_attachment_prompt(attachment)
+
+    if not prompt:
+        return
+
+    if len(prompt) > MAX_INPUT_CHARS:
+        st.warning(TOO_LONG)
+        return
+
+    if time.time() - st.session_state.last_send_time < MIN_SECONDS_BETWEEN_SENDS:
+        st.warning(SLOW_DOWN)
+        return
+
+    asked = sum(
+        1 for m in st.session_state.messages if m.get("role") == "user"
+    )
+    if asked >= MAX_QUESTIONS_PER_CHAT:
+        st.warning(TOO_MANY_QUESTIONS)
+        return
+
+    st.session_state.messages.append(
+        ChatMessage(role="user", text=prompt, attachment=attachment).to_dict()
+    )
+
+    if not st.session_state.chat_title:
+        st.session_state.chat_title = format_chat_title(prompt)
+        st.session_state.chat_title_widget_version += 1
+
+    st.session_state.last_send_time = time.time()
+    st.session_state.run_pending = True
+
+    clear_pending_attachment()
+    st.rerun()
+
+
+user_count = sum(
+    1 for m in st.session_state.messages if m.get("role") == "user"
+)
+questions_left = max(0, MAX_QUESTIONS_PER_CHAT - user_count)
+memory_context = build_memory_context(
+    st.session_state.user_profile,
+    st.session_state.memory_facts,
+    st.session_state.conversation_summary,
+)
+
+
+with st.sidebar:
+    st.header("⚙️ Trueman Settings")
+
+    title_widget_key = (
+        f"chat_title_{st.session_state.chat_title_widget_version}"
+    )
+    chat_title_value = st.text_input(
+        "💬 Chat title",
+        value=st.session_state.chat_title,
+        key=title_widget_key,
+        placeholder="Name this conversation",
+    )
+    st.session_state.chat_title = chat_title_value
+
+    learning_mode = st.selectbox(
+        "🎓 Learning mode",
+        options=list(LEARNING_MODES.keys()),
+        key="learning_mode",
+    )
+
+    chaos = st.slider(
+        "🔥 Chaos level",
+        min_value=1,
+        max_value=10,
+        value=6,
+        help="1 = calm uncle sipping tea, 10 = full braai energy",
+    )
+
+    st.checkbox(
+        "✨ Generate follow-up suggestions",
+        key="generate_followups",
+    )
+
+    st.checkbox(
+        "🧠 Auto-summarize long chats",
+        help="Uses an extra model call only when a chat gets really long.",
+        key="auto_summary",
+    )
+
+    st.metric(
+        "🔢 Tokens used this chat",
+        st.session_state.total_tokens,
+    )
+
+    if questions_left > 0:
+        st.caption(f"💬 {questions_left} questions left in this chat")
+    else:
+        st.warning("Question limit reached for this chat")
+
+    liked = sum(
+        1 for m in st.session_state.messages if m.get("feedback") == 1
+    )
+    disliked = sum(
+        1 for m in st.session_state.messages if m.get("feedback") == -1
+    )
+    st.caption(f"Feedback: 👍 {liked} · 👎 {disliked}")
+
+    with st.expander("🧠 Memory", expanded=False):
+        st.caption("Memory is used across chats until you clear it.")
+
+        name = st.text_input(
+            "Your name",
+            value=st.session_state.user_profile.get("name", ""),
+            key="profile_name",
+        )
+        location = st.text_input(
+            "Location",
+            value=st.session_state.user_profile.get("location", ""),
+            key="profile_location",
+        )
+        interests = st.text_input(
+            "Interests",
+            value=st.session_state.user_profile.get("interests", ""),
+            key="profile_interests",
+        )
+        goals = st.text_input(
+            "Goals",
+            value=st.session_state.user_profile.get("goals", ""),
+            key="profile_goals",
+        )
+
+        st.session_state.user_profile = {
+            "name": name.strip(),
+            "location": location.strip(),
+            "interests": interests.strip(),
+            "goals": goals.strip(),
+        }
+
+        fact_widget_key = (
+            f"new_memory_fact_{st.session_state.memory_fact_widget_version}"
+        )
+        st.text_input(
+            "Remember a fact",
+            key=fact_widget_key,
+            placeholder="Example: I’m studying for a chemistry exam",
+        )
+
+        st.button(
+            "Add fact",
+            key="add_memory_fact",
+            use_container_width=True,
+            on_click=add_memory_fact_callback,
+        )
+
+        if st.session_state.memory_facts:
+            st.caption("Remembered facts:")
+            for index, fact in enumerate(st.session_state.memory_facts):
+                cols = st.columns([5, 1])
+                cols[0].write(f"• {fact}")
+                if cols[1].button(
+                    "×",
+                    key=f"remove_memory_{index}",
+                    help="Forget this fact",
+                ):
+                    st.session_state.memory_facts.pop(index)
+                    st.rerun()
+
+        if st.session_state.conversation_summary:
+            st.caption(
+                "Current summary: "
+                + truncate_text(st.session_state.conversation_summary, 180)
+            )
+
+            if st.button(
+                "Clear conversation summary",
+                key="clear_conversation_summary",
+                use_container_width=True,
+            ):
+                st.session_state.conversation_summary = ""
+                st.session_state.summary_next_at = SUMMARY_TRIGGER_MESSAGES
+                st.rerun()
+
+        st.button(
+            "Clear all memory",
+            key="clear_all_memory",
+            use_container_width=True,
+            on_click=clear_all_memory_callback,
+        )
+
+    with st.expander("📎 Attachments and voice", expanded=False):
+        uploader_types = sorted(
+            ext.lstrip(".")
+            for ext in (
+                TEXT_EXTENSIONS
+                | IMAGE_EXTENSIONS
+                | AUDIO_EXTENSIONS
+                | {".pdf"}
+            )
+        )
+
+        uploaded_file = st.file_uploader(
+            "Upload a file, image, PDF, or audio clip",
+            type=uploader_types,
+            key=f"uploader_{st.session_state.uploader_version}",
+        )
+
+        if uploaded_file is not None:
+            file_key = f"{uploaded_file.name}:{uploaded_file.size}"
+            if file_key != st.session_state.pending_attachment_key:
+                attachment, error = process_uploaded_file(uploaded_file)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.pending_attachment = attachment
+                    st.session_state.pending_attachment_key = file_key
+
+        audio_input = getattr(st, "audio_input", None)
+        if audio_input is not None:
+            audio_value = audio_input(
+                "🎙️ Record a voice note",
+                key=f"audio_{st.session_state.audio_version}",
+            )
+
+            if audio_value is not None:
+                audio_id = hashlib.sha1(audio_value.getvalue()).hexdigest()
+                if audio_id != st.session_state.processed_audio_id:
+                    attachment, error = process_audio_value(audio_value)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.session_state.pending_attachment = attachment
+                        st.session_state.pending_attachment_key = (
+                            f"audio:{audio_id}"
+                        )
+                        st.session_state.processed_audio_id = audio_id
+        else:
+            st.caption("Voice notes need a newer version of Streamlit.")
+
+        if st.session_state.pending_attachment:
+            st.success(
+                "Ready to send: "
+                + attachment_label(st.session_state.pending_attachment)
+            )
+            st.button(
+                "Send attachment now",
+                key="send_attachment_now",
+                use_container_width=True,
+                on_click=send_attachment_now_callback,
+            )
+            st.button(
+                "Remove attachment",
+                key="remove_attachment",
+                use_container_width=True,
+                on_click=clear_pending_attachment,
+            )
+            st.caption("Or type a question below and it goes along with it.")
+
+    st.divider()
+
+    st.button(
+        "🗑️ Clear chat",
+        key="clear_chat",
+        use_container_width=True,
+        on_click=clear_chat_callback,
+    )
+
+    if st.session_state.messages:
+        export_name = (
+            re.sub(
+                r"[^a-z0-9]+",
+                "-",
+                (st.session_state.chat_title or "").lower(),
+            ).strip("-")
+            or "trueman-chat"
+        )
+        st.download_button(
+            "⬇️ Export chat (Markdown)",
+            data=build_markdown_export(st.session_state.messages),
+            file_name=f"{export_name}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    with st.expander("🔗 Share chat", expanded=False):
+        st.caption(
+            "Creates a private link with a random ID. The chat is stored "
+            "on the server for 7 days and you can revoke it any time. "
+            "Attachments are never shared, and links stop working if the "
+            "app restarts."
+        )
+
+        if st.button(
+            "Create share link",
+            key="create_share_link",
+            use_container_width=True,
+            disabled=not st.session_state.messages,
+        ):
+            try:
+                new_share_id = save_shared_chat(
+                    st.session_state.messages,
+                    st.session_state.chat_title,
+                )
+                st.session_state.share_ids.append(new_share_id)
+            except Exception as e:
+                st.error(f"Couldn't create the share link: {e}")
+
+        for share_id in list(st.session_state.share_ids):
+            st.code(f"{APP_URL}/?share={share_id}", language=None)
+            if st.button(
+                "Revoke this link",
+                key=f"revoke_{share_id}",
+                use_container_width=True,
+            ):
+                revoke_shared_chat(share_id)
+                st.session_state.share_ids.remove(share_id)
+                st.rerun()
+
+    with st.expander("📈 Performance", expanded=False):
+        log = st.session_state.telemetry
+        if log:
+            last = log[-1]
+            average = sum(item["elapsed"] for item in log) / len(log)
+            failed = sum(1 for item in log if not item["ok"])
+            st.caption(
+                f"Last: {last['elapsed']:.2f}s · "
+                f"{last['model'] or 'no model'} · "
+                f"retries {last['retries']}"
+            )
+            st.caption(
+                f"Average {average:.2f}s over {len(log)} requests · "
+                f"{failed} failed"
+            )
+        else:
+            st.caption("No requests yet.")
+
+        cooling = [m for m in MODELS if m not in available_models()]
+        if cooling:
+            st.caption("Cooling down: " + ", ".join(cooling))
+
+
+shared = st.session_state.shared_chat_payload
+
+if shared and shared.get("expired"):
+    st.warning("That shared chat link has expired or was revoked.")
+    st.button("Dismiss", key="dismiss_expired", on_click=dismiss_shared_chat_callback)
+elif shared and "messages" in shared:
+    st.info(
+        f"💬 Shared chat: **{shared.get('title', 'Shared chat')}** "
+        f"({len(shared['messages'])} messages, read-only preview)"
+    )
+    with st.expander("Preview"):
+        for shared_message in shared["messages"]:
+            who = "You" if shared_message["role"] == "user" else "Trueman"
+            st.markdown(f"**{who}:** {shared_message['text']}")
+    st.button(
+        "Import as my chat (replaces the current chat)",
+        key="import_shared_chat",
+        use_container_width=True,
+        on_click=import_shared_chat_callback,
+    )
+    st.button(
+        "Dismiss",
+        key="dismiss_shared_chat",
+        use_container_width=True,
+        on_click=dismiss_shared_chat_callback,
+    )
+
+
+messages = st.session_state.messages
+
+if not messages:
+    st.write("Howzit! Ask me anything, or pick a starter:")
+    for suggestion_index, suggestion in enumerate(SUGGESTIONS):
+        st.button(
+            suggestion,
+            key=f"suggestion_{suggestion_index}",
+            use_container_width=True,
+            on_click=queue_prompt_callback,
+            args=(suggestion,),
+        )
+
+last_index = len(messages) - 1
+last_user_index = max(
+    (i for i, m in enumerate(messages) if m.get("role") == "user"),
+    default=-1,
+)
+
+for index, message in enumerate(messages):
+    role = message.get("role", "user")
+
+    with st.chat_message("user" if role == "user" else "assistant"):
+        attachment = message.get("attachment")
+        if attachment:
+            render_attachment(attachment)
+
+        editing = (
+            role == "user"
+            and st.session_state.edit_message_index == index
+        )
+
+        if editing:
+            st.text_area(
+                "Edit your message",
+                value=message.get("text", ""),
+                key=f"edit_text_{st.session_state.edit_widget_version}",
+                height=120,
+            )
+            st.button(
+                "Save and resend",
+                key=f"save_edit_{index}",
+                use_container_width=True,
+                on_click=save_edit_callback,
+                args=(index,),
+            )
+            st.button(
+                "Cancel",
+                key=f"cancel_edit_{index}",
+                use_container_width=True,
+                on_click=cancel_edit_callback,
+            )
+        elif message.get("error"):
+            st.error(message.get("text", SOMETHING_BROKE))
+
+            if message.get("retryable"):
+                wait = cooldown_remaining()
+                if wait:
+                    st.caption(f"⏳ My models recharge in about {wait}s.")
+                st.button(
+                    "🔄 Retry",
+                    key=f"retry_failed_{index}",
+                    disabled=wait > 0,
+                    on_click=retry_failed_callback,
+                    args=(index,),
+                )
+        else:
+            st.markdown(message.get("text", ""))
+
+        if role == "user" and index == last_user_index and not editing:
+            if not st.session_state.run_pending:
+                st.button(
+                    "✏️ Edit",
+                    key=f"edit_{index}",
+                    on_click=start_edit_callback,
+                    args=(index,),
+                )
+
+        if role == "assistant" and not message.get("error"):
+            if DEBUG and message.get("model"):
+                st.caption(
+                    f"{message['model']} · {message.get('tokens', 0)} tokens"
+                )
+
+            feedback = message.get("feedback")
+            label = "⋯" if feedback is None else ("👍" if feedback == 1 else "👎")
+
+            with st.popover(label):
+                st.button(
+                    "👍 Good answer",
+                    key=f"like_{index}",
+                    use_container_width=True,
+                    on_click=set_feedback_callback,
+                    args=(index, 1),
+                )
+                st.button(
+                    "👎 Bad answer",
+                    key=f"dislike_{index}",
+                    use_container_width=True,
+                    on_click=set_feedback_callback,
+                    args=(index, -1),
+                )
+                st.button(
+                    "🔊 Read aloud",
+                    key=f"speak_{index}",
+                    use_container_width=True,
+                    on_click=speak_callback,
+                    args=(index,),
+                )
+                if index == last_index:
+                    st.button(
+                        "🔄 Regenerate",
+                        key=f"regenerate_{index}",
+                        use_container_width=True,
+                        on_click=regenerate_callback,
+                    )
+
+            if index == last_index and not st.session_state.run_pending:
+                for followup_index, followup in enumerate(
+                    message.get("followups") or []
+                ):
+                    st.button(
+                        followup,
+                        key=f"followup_{index}_{followup_index}",
+                        use_container_width=True,
+                        on_click=queue_prompt_callback,
+                        args=(followup,),
+                    )
+
+if st.session_state.speak_message_index is not None:
+    speak_index = st.session_state.speak_message_index
+    st.session_state.speak_message_index = None
+    if 0 <= speak_index < len(messages):
+        render_speaker(messages[speak_index].get("text", ""))
+
+
+if st.session_state.run_pending:
+    st.session_state.run_pending = False
+
+    if messages and messages[-1].get("role") == "user":
+        run_trueman(
+            chaos=chaos,
+            learning_mode=learning_mode,
+            memory_context=memory_context,
+            generate_followups_enabled=st.session_state.generate_followups,
+        )
+        st.rerun()
+
+
+if st.session_state.force_send_attachment:
+    st.session_state.force_send_attachment = False
+    submit_user_message("")
+
+queued_prompt = st.session_state.queued_prompt
+if queued_prompt:
+    st.session_state.queued_prompt = None
+    submit_user_message(queued_prompt)
+
+typed_prompt = st.chat_input("Ask Trueman anything...")
+if typed_prompt:
+    submit_user_message(typed_prompt)
