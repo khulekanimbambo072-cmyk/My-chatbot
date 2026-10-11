@@ -355,4 +355,33 @@ def is_quota_error(error: Exception | str) -> bool:
 
 
 def should_retry(error: Exception | str) -> bool:
-    text = str(
+    text = str(error).lower()
+    if is_quota_error(text):
+        return False
+    return any(marker in text for marker in RETRYABLE_ERRORS)
+
+
+def short_reason(error: str) -> str:
+    low = error.lower()
+    for marker in RATE_LIMIT_ERRORS:
+        start = low.find(marker)
+        if start >= 0:
+            break
+    else:
+        start = 0
+    return error[start : start + 160]
+
+
+def retry_delay(attempt: int) -> None:
+    delay = min(8.0, 0.75 * (2**attempt))
+    time.sleep(delay + random.uniform(0, 0.5))
+
+
+def cooldown_model(model: str, seconds: int) -> None:
+    st.session_state.model_cooldowns[model] = time.monotonic() + seconds
+
+
+def available_models() -> list[str]:
+    now = time.monotonic()
+    cooldowns = st.session_state.model_cooldowns
+    
