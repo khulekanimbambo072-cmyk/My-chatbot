@@ -1,28 +1,32 @@
+"""Trueman: one-page Streamlit chatbot (personality + upgrades merged)."""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import mimetypes
+import random
+import re
+import secrets
+import smtplib
+import ssl
 import tempfile
 import time
 import uuid
-import secrets
-import json
-import re
-import io
-import mimetypes
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from dataclasses import asdict, dataclass
 from datetime import date
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Literal
-import random
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 
 try:
     from twilio.rest import Client as TwilioClient
+
     TWILIO_AVAILABLE = True
 except ImportError:
     TWILIO_AVAILABLE = False
@@ -39,9 +43,9 @@ st.title("😄 Trueman AI Assistant + Communications")
 
 
 # ---------------- Settings ----------------
-USE_SEARCH = False       
-USE_CODE_EXEC = False    
-DEBUG = True             
+USE_SEARCH = False       # Google Search tool (turn on only if your models support it)
+USE_CODE_EXEC = False    # Gemini code-execution tool (off by default)
+DEBUG = False            # keep False in public apps: traces would show in replies, exports and shares
 
 APP_URL = "https://50trueman.streamlit.app"
 
@@ -59,8 +63,22 @@ FOLLOWUP_COUNT = 3
 MAX_ATTEMPTS_PER_MODEL = 3
 QUOTA_COOLDOWN_SECONDS = 90
 SHARE_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_ATTACHMENTS_IN_MEMORY = 2
+GLOBAL_MAX_REQUESTS_PER_MINUTE = 30
 
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+VOICE_MAX_CHARS = 1000
+MAX_VOICE_CLIPS_PER_SESSION = 15
+MAX_VOICE_CLIPS_PER_DAY = 60
+
+MISSING_MODEL_COOLDOWN_SECONDS = 60 * 60
+
+MAX_MESSAGES_PER_SESSION = 10
+MIN_SECONDS_BETWEEN_MESSAGES = 10
+GLOBAL_MAX_SENDS_PER_MINUTE = 20
+MAX_EMAIL_SUBJECT_CHARS = 150
+MAX_EMAIL_BODY_CHARS = 5000
+MAX_SMS_CHARS = 480
 
 MODELS = list(
     dict.fromkeys(
@@ -111,6 +129,7 @@ TEXT_EXTENSIONS = {
 }
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac"}
 
 OUT_OF_ENERGY = (
@@ -135,10 +154,9 @@ TOO_LONG = (
     "you the good stuff."
 )
 
-SLOW_DOWN = (
-    "Eish, hang on bra! Even my genius needs "
-    f"{MIN_SECONDS_BETWEEN_SENDS} seconds between questions. "
-    "Try again now, sharp?"
+BUSY = (
+    "Eish, the whole braai is asking me questions at once! Give me "
+    "a minute to catch my breath, then try again, sharp?"
 )
 
 FILE_TOO_LARGE = (
@@ -152,14 +170,37 @@ UNSUPPORTED_FILE = (
 )
 
 RETRYABLE_ERRORS = (
-    "503", "unavailable", "overloaded", "deadline", "timeout", "timed out", "internal"
+    "503",
+    "unavailable",
+    "overloaded",
+    "deadline",
+    "timeout",
+    "timed out",
+    "internal",
 )
 
 RATE_LIMIT_ERRORS = (
-    "429", "quota", "rate limit", "resource exhausted", "resource_exhausted"
+    "429",
+    "quota",
+    "rate limit",
+    "resource exhausted",
+    "resource_exhausted",
+)
+
+MISSING_MODEL_ERRORS = ("404", "not found", "not_found")
+
+BAD_KEY_ERRORS = (
+    "api key not valid",
+    "api_key_invalid",
+    "reported as leaked",
+)
+
+BAD_KEY = (
+    "Yoh, Gemini rejected that API key. Check it in the sidebar (🔑 Gemini API key) and try again, sharp?"
 )
 
 
+# ---------------- Typed message model ----------------
 Role = Literal["user", "assistant"]
 
 
@@ -179,6 +220,7 @@ class ChatMessage:
         return asdict(self)
 
 
+# ---------------- Personality ----------------
 def chaos_instruction(level: int) -> str:
     if level <= 3:
         return (
@@ -186,12 +228,14 @@ def chaos_instruction(level: int) -> str:
             "more focus - like a wise uncle sipping tea. Still warm, "
             "just softer."
         )
+
     if level >= 8:
         return (
             "ENERGY LEVEL: Maximum chaos! Be dramatic, exaggerate "
             "wildly, turn every answer into a performance - full braai "
             "energy, but never mean."
         )
+
     return (
         "ENERGY LEVEL: Your normal self - playful, warm, energetic, "
         "but sensible when it matters."
@@ -215,6 +259,7 @@ def build_memory_context(
     summary: str,
 ) -> str:
     lines = []
+
     if profile.get("name"):
         lines.append(f"Name: {profile['name']}")
     if profile.get("location"):
@@ -274,7 +319,8 @@ def get_personality(
     if mode_instruction:
         text += mode_instruction + " "
 
-    text += chaos_instruction(chaos) + " "
+    text += chaos_instruction(chaos)
+    text += " "
 
     if memory_context:
         text += (
@@ -284,53 +330,39 @@ def get_personality(
             "the memory directly unless it is useful. "
         )
 
+    if can_search:
+        text += (
+            "SEARCH: You can search the internet for current news, "
+            "scores and prices. Use it when a question needs "
+            "up-to-date facts. "
+        )
+    else:
+        text += (
+            "LIMITS: You cannot look up live information like news, "
+            "weather or scores. If asked, say so honestly with a joke, "
+            "and share what you do know. "
+        )
+
     text += f"Today's date is {date.today():%A, %d %B %Y}."
     return text
 
 
-@st.cache_resource(show_spinner=False)
+def get_secret(name: str) -> str:
+    # Secrets are read on the server only and never shown in the page.
+    try:
+        return str(st.secrets.get(name, "") or "")
+    except Exception:
+        return ""
+
+
+@st.cache_resource(show_spinner=False, max_entries=20)
 def get_client(api_key):
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
-
-
-# --- Helper functions for Email & SMS ---
-def send_email_alert(smtp_email, smtp_password, to_email, subject, body):
-    if not smtp_email or not smtp_password:
-        return False, "Gmail sender address or App Password missing in settings."
     try:
-        msg = MIMEMultipart()
-        msg['From'] = smtp_email
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(smtp_email, smtp_password)
-        server.sendmail(smtp_email, to_email, msg.as_string())
-        server.quit()
-        return True, "Email sent successfully!"
-    except Exception as e:
-        return False, str(e)
-
-
-def send_sms_alert(twilio_sid, twilio_token, twilio_phone, to_phone, message_body):
-    if not TWILIO_AVAILABLE:
-        return False, "Twilio library not installed."
-    if not twilio_sid or not twilio_token or not twilio_phone:
-        return False, "Twilio credentials missing in settings."
-    try:
-        client = TwilioClient(twilio_sid, twilio_token)
-        message = client.messages.create(
-            body=message_body,
-            from_=twilio_phone,
-            to=to_phone
-        )
-        return True, f"SMS sent! SID: {message.sid}"
-    except Exception as e:
-        return False, str(e)
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
 
 
 def build_config(
@@ -346,15 +378,36 @@ def build_config(
             memory_context=memory_context,
         )
     }
+
+    tools = []
+    if USE_SEARCH:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if USE_CODE_EXEC:
+        tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
+    if tools:
+        config_kwargs["tools"] = tools
+
     return types.GenerateContentConfig(**config_kwargs)
 
 
+# ---------------- Errors, cooldowns and retries ----------------
 def is_quota_error(error: Exception | str) -> bool:
     text = str(error).lower()
     return any(marker in text for marker in RATE_LIMIT_ERRORS)
 
 
+def is_missing_model_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in MISSING_MODEL_ERRORS)
+
+
+def is_bad_key_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in BAD_KEY_ERRORS)
+
+
 def should_retry(error: Exception | str) -> bool:
+    """Retry only temporary failures, never quota/rate-limit errors."""
     text = str(error).lower()
     if is_quota_error(text):
         return False
@@ -363,35 +416,72 @@ def should_retry(error: Exception | str) -> bool:
 
 def short_reason(error: str) -> str:
     low = error.lower()
+
     for marker in RATE_LIMIT_ERRORS:
         start = low.find(marker)
         if start >= 0:
             break
     else:
         start = 0
+
     return error[start : start + 160]
 
 
 def retry_delay(attempt: int) -> None:
+    """Bounded exponential backoff with a little jitter."""
     delay = min(8.0, 0.75 * (2**attempt))
     time.sleep(delay + random.uniform(0, 0.5))
 
 
+@st.cache_resource(show_spinner=False)
+def get_shared_state() -> dict[str, Any]:
+    """Process-wide state shared by every visitor."""
+    return {
+        "cooldowns": {},
+        "requests": [],
+        "voice_day": "",
+        "voice_count": 0,
+        "sends": [],
+    }
+
+
+def global_rate_limited() -> bool:
+    """Protect the shared API quota from bursts across all visitors."""
+    if st.session_state.get("using_own_key"):
+        return False
+
+    shared = get_shared_state()
+    now = time.time()
+    shared["requests"] = [t for t in shared["requests"] if now - t < 60]
+    if len(shared["requests"]) >= GLOBAL_MAX_REQUESTS_PER_MINUTE:
+        return True
+    shared["requests"].append(now)
+    return False
+
+
+def cooldown_store() -> dict[str, float]:
+    # A visitor using their own key has their own quota, so keep it separate.
+    if st.session_state.get("using_own_key"):
+        return st.session_state.own_cooldowns
+    return get_shared_state()["cooldowns"]
+
+
 def cooldown_model(model: str, seconds: int) -> None:
-    st.session_state.model_cooldowns[model] = time.monotonic() + seconds
+    cooldown_store()[model] = time.monotonic() + seconds
 
 
 def available_models() -> list[str]:
     now = time.monotonic()
-    cooldowns = st.session_state.model_cooldowns
+    cooldowns = cooldown_store()
     return [model for model in MODELS if cooldowns.get(model, 0) <= now]
 
 
 def cooldown_remaining() -> int:
+    """Seconds until at least one model is usable again (0 if usable now)."""
     if available_models():
         return 0
     now = time.monotonic()
-    cooldowns = st.session_state.model_cooldowns
+    cooldowns = cooldown_store()
     soonest = min(cooldowns.get(model, 0) for model in MODELS)
     return max(0, int(soonest - now) + 1)
 
@@ -399,8 +489,11 @@ def cooldown_remaining() -> int:
 def note_failure(model: str, error: Exception) -> None:
     if is_quota_error(error):
         cooldown_model(model, QUOTA_COOLDOWN_SECONDS)
+    elif is_missing_model_error(error):
+        cooldown_model(model, MISSING_MODEL_COOLDOWN_SECONDS)
 
 
+# ---------------- Telemetry ----------------
 def new_request_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -424,15 +517,18 @@ def record_request(
     del log[:-50]
 
 
+# ---------------- Message and context helpers ----------------
 def message_size(message: dict[str, Any]) -> int:
     size = len(message.get("text", ""))
     attachment = message.get("attachment") or {}
     size += len(attachment.get("extracted_text", ""))
+    # Roughly weight binary attachments so old large files fall out of context.
     size += len(attachment.get("data", b"")) // 4
     return size
 
 
 def trim_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the latest turns plus the first user message as the anchor."""
     valid = [m for m in messages if not m.get("error")]
     recent = valid[-MAX_RECENT_MESSAGES:]
 
@@ -457,11 +553,17 @@ def trim_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def attachment_label(attachment: dict[str, Any]) -> str:
     name = attachment.get("name", "attachment")
     kind = attachment.get("kind", "file")
-    icons = {"document": "📄", "image": "🖼️", "audio": "🎙️", "file": "📎"}
+    icons = {
+        "document": "📄",
+        "image": "🖼️",
+        "audio": "🎙️",
+        "file": "📎",
+    }
     return f"{icons.get(kind, '📎')} {name}"
 
 
 def attachment_text_part(name: str, text: str) -> types.Part:
+    """Wrap extracted file text so the model treats it as data only."""
     safe_text = truncate_text(text, MAX_EXTRACTED_FILE_CHARS).replace(
         "</attachment>", "<\\/attachment>"
     )
@@ -488,6 +590,14 @@ def parts_from_attachment(attachment: dict[str, Any]) -> list[types.Part]:
     name = attachment.get("name", "attachment")
     extracted_text = attachment.get("extracted_text", "")
 
+    if attachment.get("released") and not attachment.get("data"):
+        return [
+            types.Part(
+                text=f"[Earlier attachment '{name}' is no longer available.]"
+            )
+        ]
+
+    # Extracted text OR the binary file, never both.
     if extracted_text:
         parts.append(attachment_text_part(name, extracted_text))
         return parts
@@ -497,7 +607,9 @@ def parts_from_attachment(attachment: dict[str, Any]) -> list[types.Part]:
 
     if data and mime_type:
         try:
-            parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+            parts.append(
+                types.Part.from_bytes(data=data, mime_type=mime_type)
+            )
         except Exception:
             parts.append(
                 types.Part(
@@ -529,7 +641,11 @@ def build_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
         contents.append(
             types.Content(
                 role="model",
-                parts=[types.Part(text="Got it — I'll use that earlier context.")],
+                parts=[
+                    types.Part(
+                        text="Got it — I'll use that earlier context."
+                    )
+                ],
             )
         )
 
@@ -547,6 +663,7 @@ def build_contents(messages: list[dict[str, Any]]) -> list[types.Content]:
     return contents
 
 
+# ---------------- Main streaming ----------------
 def stream_trueman(
     messages: list[dict[str, Any]],
     result: dict[str, Any],
@@ -565,6 +682,7 @@ def stream_trueman(
     models_to_try = available_models()
     tried: list[str] = []
     saw_quota_error = not models_to_try
+    bad_key = False
 
     for model in models_to_try:
         for attempt in range(MAX_ATTEMPTS_PER_MODEL):
@@ -614,6 +732,8 @@ def stream_trueman(
                 error = str(e)
 
                 if yielded_text:
+                    # Part of the answer is already on screen; don't retry
+                    # (it would duplicate text). Finish gracefully.
                     result["ok"] = True
                     result["model"] = model
                     result["tokens"] = current_request_tokens
@@ -623,10 +743,20 @@ def stream_trueman(
                     )
                     return
 
+                if is_bad_key_error(error):
+                    bad_key = True
+                    tried.append(f"{model}: key rejected")
+                    break
+
                 if is_quota_error(error):
                     saw_quota_error = True
                     cooldown_model(model, QUOTA_COOLDOWN_SECONDS)
                     tried.append(f"{model}: {short_reason(error)}")
+                    break
+
+                if is_missing_model_error(error):
+                    cooldown_model(model, MISSING_MODEL_COOLDOWN_SECONDS)
+                    tried.append(f"{model}: model not available")
                     break
 
                 if should_retry(e) and attempt < MAX_ATTEMPTS_PER_MODEL - 1:
@@ -637,20 +767,27 @@ def stream_trueman(
                 tried.append(f"{model}: {short_reason(error)}")
                 break
 
+        if bad_key:
+            break
+
     result["ok"] = False
     result["model"] = None
     result["tokens"] = 0
     result["error_details"] = tried
     result["quota"] = saw_quota_error
 
-    reply = OUT_OF_ENERGY if saw_quota_error else SOMETHING_BROKE
+    if bad_key:
+        reply = BAD_KEY
+    else:
+        reply = OUT_OF_ENERGY if saw_quota_error else SOMETHING_BROKE
 
     if DEBUG:
-        reply += "\n\n(debug error trace:\n" + "\n".join(tried) + ")"
+        reply += "\n\n(debug:\n" + "\n".join(tried) + ")"
 
     yield reply
 
 
+# ---------------- Follow-up suggestions ----------------
 def fallback_followups(
     learning_mode: str,
     user_text: str,
@@ -664,12 +801,14 @@ def fallback_followups(
             "Give me a harder one",
             "Quiz me on the last answer",
         ]
+
     if learning_mode == "Flashcards":
         return [
             "Make more flashcards",
             "Test me with those cards",
             "Turn that into a summary",
         ]
+
     if learning_mode == "Tutor":
         return [
             "Continue the lesson",
@@ -709,7 +848,10 @@ def generate_followups(
     )
 
     config = types.GenerateContentConfig(
-        system_instruction="You generate concise follow-up questions for a helpful chatbot."
+        system_instruction=(
+            "You generate concise follow-up questions for a helpful "
+            "chatbot."
+        )
     )
 
     for model in available_models()[:2]:
@@ -727,8 +869,10 @@ def generate_followups(
 
             text = response.text or ""
             lines = []
+
             for line in text.splitlines():
-                cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+                cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line)
+                cleaned = cleaned.strip()
                 if cleaned:
                     lines.append(cleaned)
 
@@ -742,9 +886,11 @@ def generate_followups(
     return fallback
 
 
+# ---------------- Memory and summaries ----------------
 def generate_chat_summary(messages: list[dict[str, Any]], active_client: Any) -> str:
     visible = [
-        m for m in messages
+        m
+        for m in messages
         if not m.get("error") and m.get("role") in {"user", "assistant"}
     ]
 
@@ -767,7 +913,9 @@ def generate_chat_summary(messages: list[dict[str, Any]], active_client: Any) ->
     )
 
     config = types.GenerateContentConfig(
-        system_instruction="You create concise, accurate conversation summaries."
+        system_instruction=(
+            "You create concise, accurate conversation summaries."
+        )
     )
 
     for model in available_models()[:2]:
@@ -792,20 +940,29 @@ def generate_chat_summary(messages: list[dict[str, Any]], active_client: Any) ->
             continue
 
     first_user = next(
-        (m.get("text", "") for m in visible if m.get("role") == "user"), ""
+        (m.get("text", "") for m in visible if m.get("role") == "user"),
+        "",
     )
     last_user = next(
-        (m.get("text", "") for m in reversed(visible) if m.get("role") == "user"), ""
+        (
+            m.get("text", "")
+            for m in reversed(visible)
+            if m.get("role") == "user"
+        ),
+        "",
     )
 
     return truncate_text(
-        "Main topic: " + (first_user or "General conversation") +
-        "\nRecent focus: " + (last_user or "No recent user message"),
+        "Main topic: "
+        + (first_user or "General conversation")
+        + "\nRecent focus: "
+        + (last_user or "No recent user message"),
         900,
     )
 
 
 def should_summarize(messages: list[dict[str, Any]]) -> bool:
+    """Only pay for a summary call once the chat is genuinely long."""
     visible = [m for m in messages if not m.get("error")]
     estimated_chars = sum(len(m.get("text", "")) for m in visible)
 
@@ -828,14 +985,18 @@ def maybe_update_summary(messages: list[dict[str, Any]], active_client: Any) -> 
     st.session_state.summary_next_at = len(visible) + SUMMARY_REFRESH_EVERY
 
 
+# ---------------- Attachments and voice ----------------
 def extract_pdf_text(file_bytes: bytes) -> str:
     reader_cls = None
+
     try:
         from pypdf import PdfReader
+
         reader_cls = PdfReader
     except ImportError:
         try:
             from PyPDF2 import PdfReader
+
             reader_cls = PdfReader
         except ImportError:
             return ""
@@ -843,7 +1004,9 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     try:
         reader = reader_cls(io.BytesIO(file_bytes))
         pages = reader.pages[:30]
-        return "\n\n".join(page.extract_text() or "" for page in pages).strip()
+        return "\n\n".join(
+            page.extract_text() or "" for page in pages
+        ).strip()
     except Exception:
         return ""
 
@@ -948,6 +1111,7 @@ def process_audio_value(
 
 def default_attachment_prompt(attachment: dict[str, Any]) -> str:
     kind = attachment.get("kind")
+
     if kind == "image":
         return "Please look at this image and explain what you see."
     if kind == "audio":
@@ -957,6 +1121,7 @@ def default_attachment_prompt(attachment: dict[str, Any]) -> str:
             "Please read this file and give me the key points, main "
             "takeaways, and anything important I should know."
         )
+
     return "Please review this attachment and tell me what matters."
 
 
@@ -971,43 +1136,112 @@ def render_attachment(attachment: dict[str, Any]) -> None:
         st.audio(data, format=attachment.get("mime_type", "audio/wav"))
     elif extracted_text:
         st.caption(f"{label} — {len(extracted_text):,} characters extracted")
+    elif attachment.get("released"):
+        st.caption(f"{label} — released from memory to save space")
     else:
         st.caption(label)
 
 
-def render_speaker(text: str) -> None:
-    api_key = st.secrets.get("ELEVENLABS_API_KEY")
+def clean_for_speech(text: str) -> tuple[str, bool]:
+    """Strip markdown, links and emojis; shorten at a sentence boundary."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[*_#>~|]+", "", text)
+    text = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
 
+    if len(text) <= VOICE_MAX_CHARS:
+        return text, False
+
+    cut = text[:VOICE_MAX_CHARS]
+    end_at = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end_at > VOICE_MAX_CHARS // 2:
+        cut = cut[: end_at + 1]
+    return cut.strip(), True
+
+
+def get_elevenlabs_key() -> str | None:
+    try:
+        return st.secrets.get("ELEVENLABS_API_KEY") or None
+    except Exception:
+        return None
+
+
+def voice_quota_ok() -> bool:
+    shared = get_shared_state()
+    today = str(date.today())
+    if shared["voice_day"] != today:
+        shared["voice_day"] = today
+        shared["voice_count"] = 0
+    return shared["voice_count"] < MAX_VOICE_CLIPS_PER_DAY
+
+
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=100)
+def synthesize_speech(text: str, _api_key: str) -> bytes:
+    """Cached per text, so replaying the same answer costs no credits.
+
+    Raises on failure so errors are never cached.
+    """
+    response = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+        headers={
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": _api_key,
+        },
+        json={
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"ElevenLabs returned status {response.status_code}")
+
+    shared = get_shared_state()
+    shared["voice_count"] += 1  # only real API calls count, not cache hits
+    return response.content
+
+
+def render_speaker(text: str, index: int) -> None:
+    api_key = get_elevenlabs_key()
     if not api_key:
-        st.warning("⚠️ Add `ELEVENLABS_API_KEY` to secrets to enable custom voice synthesis.")
+        st.toast("Voice isn't set up yet.")
         return
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": api_key,
-    }
-    payload = {
-        "text": truncate_text(text, 1000),
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
-    }
+    if st.session_state.voice_count >= MAX_VOICE_CLIPS_PER_SESSION:
+        st.toast("Eish, that's plenty of listening for one chat. Try again later.")
+        return
+
+    if not voice_quota_ok():
+        st.toast("My voice is resting for today. Try again tomorrow, sharp?")
+        return
+
+    speech, truncated = clean_for_speech(text)
+    if not speech:
+        return
 
     try:
         with st.spinner("Generating Trueman's voice..."):
-            res = requests.post(url, json=payload, headers=headers, timeout=15)
-            if res.status_code == 200:
-                st.audio(res.content, format="audio/mp3", autoplay=True)
-            else:
-                st.error(f"Voice generation failed ({res.status_code}): {res.text}")
+            audio = synthesize_speech(speech, api_key)
     except Exception as e:
-        st.error(f"Could not connect to ElevenLabs API: {e}")
+        st.toast("Eish, my voice isn't working right now. Try again later.")
+        if DEBUG:
+            st.caption(f"Voice error: {e}")
+        return
+
+    st.session_state.voice_count += 1
+    st.session_state.voice_clip = {
+        "index": index,
+        "audio": audio,
+        "truncated": truncated,
+        "autoplay": True,
+    }
 
 
+# ---------------- Titles and export ----------------
 def format_chat_title(prompt: str) -> str:
     title = " ".join(prompt.split())
     title = truncate_text(title, 52)
@@ -1018,6 +1252,7 @@ def format_chat_title(prompt: str) -> str:
 
 def serialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     serialized = []
+
     for message in messages:
         if message.get("error"):
             continue
@@ -1031,6 +1266,7 @@ def serialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         attachment = message.get("attachment")
         if attachment:
+            # Never share file contents, only the label.
             item["attachment"] = {
                 "name": attachment.get("name"),
                 "kind": attachment.get("kind"),
@@ -1067,6 +1303,7 @@ def build_markdown_export(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+# ---------------- Private share links (server-side, random ID) ----------------
 SHARE_DIR = Path(tempfile.gettempdir()) / "trueman_shared_chats"
 SHARE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 
@@ -1106,8 +1343,7 @@ def save_shared_chat(messages: list[dict[str, Any]], title: str) -> str:
     }
 
     path = share_path(share_id)
-    if path:
-        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
     return share_id
 
 
@@ -1145,12 +1381,25 @@ def load_shared_chat(share_id: str) -> dict[str, Any] | None:
     return {"title": str(record.get("title", "Shared chat")), "messages": cleaned}
 
 
-def revoke_shared_chat(share_id: str) -> None:
+def revoke_shared_chat(share_id: str) -> bool:
     path = share_path(share_id)
-    if path is not None:
-        path.unlink(missing_ok=True)
+    if path is None or not path.exists():
+        return False
+    path.unlink(missing_ok=True)
+    return True
 
 
+def prune_attachment_data(messages: list[dict[str, Any]]) -> None:
+    """Keep file bytes for only the most recent attachments."""
+    carriers = [
+        m for m in messages if (m.get("attachment") or {}).get("data")
+    ]
+    for m in carriers[:-MAX_ATTACHMENTS_IN_MEMORY]:
+        m["attachment"].pop("data", None)
+        m["attachment"]["released"] = True
+
+
+# ---------------- Main response runner ----------------
 def run_trueman(
     chaos: int,
     learning_mode: str,
@@ -1160,6 +1409,7 @@ def run_trueman(
 ) -> None:
     request_id = new_request_id()
     started = time.perf_counter()
+    st.session_state.voice_clip = None
 
     result: dict[str, Any] = {
         "ok": True,
@@ -1197,6 +1447,7 @@ def run_trueman(
     ).to_dict()
 
     st.session_state.messages.append(message)
+    prune_attachment_data(st.session_state.messages)
 
     elapsed = time.perf_counter() - started
     record_request(request_id, elapsed, result)
@@ -1219,6 +1470,9 @@ def run_trueman(
         )
 
         if generate_followups_enabled and user_message:
+            # Save quota: only ask the model for follow-ups on substantial
+            # answers while we still have spare models. Otherwise use the
+            # free local suggestions.
             use_model = len(reply) >= 200 and len(available_models()) >= 2
             message["followups"] = generate_followups(
                 user_message.get("text", ""),
@@ -1231,9 +1485,130 @@ def run_trueman(
         maybe_update_summary(st.session_state.messages, active_client)
 
 
+# ---------------- Messaging hub helpers (email / SMS) ----------------
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+PHONE_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+def validate_email_address(value: str) -> bool:
+    value = (value or "").strip()
+    return len(value) <= 254 and bool(EMAIL_PATTERN.fullmatch(value))
+
+
+def validate_phone_number(value: str) -> bool:
+    return bool(PHONE_PATTERN.fullmatch((value or "").strip()))
+
+
+def send_limit_message() -> str | None:
+    """Return the reason sending is blocked right now, or None if it is fine."""
+    if st.session_state.send_count >= MAX_MESSAGES_PER_SESSION:
+        return (
+            f"You've reached the limit of {MAX_MESSAGES_PER_SESSION} "
+            "messages for this session."
+        )
+
+    wait = MIN_SECONDS_BETWEEN_MESSAGES - (
+        time.time() - st.session_state.last_message_sent_at
+    )
+    if wait > 0:
+        return f"Please wait {int(wait) + 1}s before sending another message."
+
+    shared = get_shared_state()
+    now = time.time()
+    shared["sends"] = [t for t in shared["sends"] if now - t < 60]
+    if len(shared["sends"]) >= GLOBAL_MAX_SENDS_PER_MINUTE:
+        return "The messaging hub is busy right now. Try again in a minute."
+
+    return None
+
+
+def record_send_attempt() -> None:
+    # Failed attempts count too, so the hub can't be used to guess passwords.
+    st.session_state.send_count += 1
+    st.session_state.last_message_sent_at = time.time()
+    get_shared_state()["sends"].append(time.time())
+
+
+def send_email_alert(
+    smtp_email: str,
+    smtp_password: str,
+    to_email: str,
+    subject: str,
+    body: str,
+) -> tuple[bool, str]:
+    smtp_email = (smtp_email or "").strip()
+    to_email = (to_email or "").strip()
+
+    if not smtp_email or not smtp_password:
+        return False, "Add your Gmail address and App Password in the sidebar first."
+    if not validate_email_address(smtp_email):
+        return False, "The sender address doesn't look right."
+    if not validate_email_address(to_email):
+        return False, "Enter one valid recipient email address."
+
+    subject = " ".join((subject or "").split())[:MAX_EMAIL_SUBJECT_CHARS]
+    body = (body or "").strip()[:MAX_EMAIL_BODY_CHARS]
+
+    try:
+        # EmailMessage refuses header values containing line breaks, which
+        # blocks header-injection tricks.
+        message = EmailMessage()
+        message["From"] = smtp_email
+        message["To"] = to_email
+        message["Subject"] = subject or "Message from Trueman"
+        message.set_content(body)
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+            server.starttls(context=context)
+            server.login(smtp_email, smtp_password.replace(" ", ""))
+            server.send_message(message)
+
+        return True, "Email sent!"
+    except smtplib.SMTPAuthenticationError:
+        return False, (
+            "Gmail rejected the login. Use a 16-character App Password, "
+            "not your normal password."
+        )
+    except Exception as e:
+        detail = f" ({type(e).__name__})" if DEBUG else ""
+        return False, "Couldn't send the email. Check your details and try again." + detail
+
+
+def send_sms_alert(
+    twilio_sid: str,
+    twilio_token: str,
+    twilio_phone: str,
+    to_phone: str,
+    message_body: str,
+) -> tuple[bool, str]:
+    if not TWILIO_AVAILABLE:
+        return False, "SMS needs the `twilio` package. Add it to requirements.txt."
+    if not (twilio_sid or "").strip() or not (twilio_token or "").strip():
+        return False, "Add your Twilio Account SID and Auth Token in the sidebar first."
+    if not validate_phone_number(twilio_phone):
+        return False, "Your Twilio number must look like +12025550123."
+    if not validate_phone_number(to_phone):
+        return False, "Use the international format for the recipient, e.g. +27821234567."
+
+    try:
+        twilio_client = TwilioClient(twilio_sid.strip(), twilio_token.strip())
+        twilio_client.messages.create(
+            body=(message_body or "").strip()[:MAX_SMS_CHARS],
+            from_=twilio_phone.strip(),
+            to=to_phone.strip(),
+        )
+        return True, "SMS sent!"
+    except Exception as e:
+        if getattr(e, "status", None) == 401:
+            return False, "Twilio rejected your credentials."
+        detail = f" ({type(e).__name__})" if DEBUG else ""
+        return False, "Couldn't send the SMS. Check your details and try again." + detail
+
+
+# ---------------- Session state ----------------
 session_defaults = {
     "messages": [],
-    "model_cooldowns": {},
     "telemetry": [],
     "total_tokens": 0,
     "last_send_time": 0.0,
@@ -1264,6 +1639,13 @@ session_defaults = {
     "audio_version": 0,
     "share_ids": [],
     "shared_chat_payload": None,
+    "voice_count": 0,
+    "voice_clip": None,
+    "own_cooldowns": {},
+    "using_own_key": False,
+    "pending_send": None,
+    "send_count": 0,
+    "last_message_sent_at": 0.0,
 }
 
 for key, value in session_defaults.items():
@@ -1271,6 +1653,7 @@ for key, value in session_defaults.items():
         st.session_state[key] = value
 
 
+# Detect a shared-chat link (?share=<random id>) without replacing the chat.
 try:
     share_param = st.query_params.get("share", "")
 except Exception:
@@ -1282,6 +1665,7 @@ if share_param and st.session_state.shared_chat_payload is None:
     )
 
 
+# ---------------- Callbacks ----------------
 def clear_pending_attachment() -> None:
     st.session_state.pending_attachment = None
     st.session_state.pending_attachment_key = ""
@@ -1304,6 +1688,7 @@ def clear_chat_callback() -> None:
     st.session_state.edit_widget_version += 1
     st.session_state.run_pending = False
     st.session_state.queued_prompt = None
+    st.session_state.voice_clip = None
     clear_pending_attachment()
 
 
@@ -1362,11 +1747,13 @@ def import_shared_chat_callback() -> None:
     st.session_state.edit_message_index = None
     st.session_state.edit_widget_version += 1
     st.session_state.run_pending = False
+    st.session_state.voice_clip = None
     clear_pending_attachment()
     dismiss_shared_chat_callback()
 
 
 def dismiss_shared_chat_callback() -> None:
+    # Prevent the same link from prompting again on every rerun.
     st.session_state.shared_chat_payload = {"dismissed": True}
     try:
         del st.query_params["share"]
@@ -1455,15 +1842,22 @@ def submit_user_message(prompt: str) -> None:
         st.warning(TOO_LONG)
         return
 
-    if time.time() - st.session_state.last_send_time < MIN_SECONDS_BETWEEN_SENDS:
-        st.warning(SLOW_DOWN)
-        return
+    wait = MIN_SECONDS_BETWEEN_SENDS - (
+        time.time() - st.session_state.last_send_time
+    )
+    if wait > 0:
+        with st.spinner("One sec, bra..."):
+            time.sleep(min(wait, MIN_SECONDS_BETWEEN_SENDS))
 
     asked = sum(
         1 for m in st.session_state.messages if m.get("role") == "user"
     )
     if asked >= MAX_QUESTIONS_PER_CHAT:
         st.warning(TOO_MANY_QUESTIONS)
+        return
+
+    if global_rate_limited():
+        st.warning(BUSY)
         return
 
     st.session_state.messages.append(
@@ -1476,7 +1870,6 @@ def submit_user_message(prompt: str) -> None:
 
     st.session_state.last_send_time = time.time()
     st.session_state.run_pending = True
-
     clear_pending_attachment()
     st.rerun()
 
@@ -1492,36 +1885,62 @@ memory_context = build_memory_context(
 )
 
 
+# ---------------- Sidebar ----------------
+server_gemini_key = get_secret("GEMINI_API_KEY")
+
 with st.sidebar:
     st.header("⚙️ Trueman Settings")
 
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        type="password",
-        value=st.secrets.get("GEMINI_API_KEY", ""),
-        help="Enter your Gemini API key"
-    )
+    with st.expander("🔑 Gemini API key", expanded=not server_gemini_key):
+        own_gemini_key = st.text_input(
+            "Use your own key (optional)",
+            type="password",
+            key="own_gemini_key",
+            help=(
+                "Leave empty to use the app's key. Your key is only used "
+                "in this session and is never stored."
+            ),
+        )
 
-    app_mode = st.radio("Navigation", ["Trueman Chat", "Messaging Hub (Email/SMS)"])
+    app_mode = st.radio(
+        "Navigation",
+        ["Trueman Chat", "Messaging Hub (Email/SMS)"],
+        key="app_mode",
+    )
 
     st.markdown("---")
     st.header("📨 Communications Setup")
     with st.expander("Email (SMTP) Settings"):
-        smtp_email = st.text_input("Sender Gmail Address", placeholder="your-email@gmail.com")
-        smtp_password = st.text_input("Gmail App Password", type="password", placeholder="16-digit app password")
-    
+        smtp_email = st.text_input(
+            "Sender Gmail Address",
+            key="smtp_email",
+            placeholder="your-email@gmail.com",
+        )
+        smtp_password = st.text_input(
+            "Gmail App Password",
+            type="password",
+            key="smtp_password",
+            placeholder="16-character app password",
+        )
+        st.caption("Details stay in this session only and are never stored.")
+
     with st.expander("SMS (Twilio) Settings"):
-        twilio_sid = st.text_input("Twilio Account SID", placeholder="ACxxxx...")
-        twilio_token = st.text_input("Twilio Auth Token", type="password", placeholder="your_auth_token")
-        twilio_phone = st.text_input("Twilio Phone Number", placeholder="+1234567890")
+        twilio_sid = st.text_input(
+            "Twilio Account SID", key="twilio_sid", placeholder="ACxxxx..."
+        )
+        twilio_token = st.text_input(
+            "Twilio Auth Token", type="password", key="twilio_token"
+        )
+        twilio_phone = st.text_input(
+            "Twilio Phone Number", key="twilio_phone", placeholder="+12025550123"
+        )
+        st.caption("Details stay in this session only and are never stored.")
 
-    if not api_key_input:
-        st.warning("Please enter your Gemini API key above.")
-        st.stop()
+    st.session_state.using_own_key = bool(own_gemini_key.strip())
+    active_client = get_client(own_gemini_key.strip() or server_gemini_key)
 
-    active_client = get_client(api_key_input)
-    if not active_client:
-        st.error("Couldn't load client. Please check your API key.")
+    if app_mode == "Trueman Chat" and active_client is None:
+        st.warning("Please add a Gemini API key above to chat with Trueman.")
         st.stop()
 
     if app_mode == "Trueman Chat":
@@ -1789,6 +2208,26 @@ with st.sidebar:
                     st.session_state.share_ids.remove(share_id)
                     st.rerun()
 
+            st.caption("Lost a link after a reload? Paste it here to revoke it.")
+            pasted_link = st.text_input(
+                "Link to revoke",
+                key="revoke_link_input",
+                placeholder=f"{APP_URL}/?share=...",
+            )
+            if st.button(
+                "Revoke pasted link",
+                key="revoke_pasted_link",
+                use_container_width=True,
+                disabled=not pasted_link.strip(),
+            ):
+                ids = re.findall(r"[A-Za-z0-9_-]{32,64}", pasted_link)
+                if ids and revoke_shared_chat(ids[-1]):
+                    if ids[-1] in st.session_state.share_ids:
+                        st.session_state.share_ids.remove(ids[-1])
+                    st.success("Link revoked.")
+                else:
+                    st.warning("No active link found for that.")
+
         with st.expander("📈 Performance", expanded=False):
             log = st.session_state.telemetry
             if log:
@@ -1815,33 +2254,120 @@ with st.sidebar:
 # --- MODE ROUTING ---
 if app_mode == "Messaging Hub (Email/SMS)":
     st.subheader("📢 Trueman Direct Communications Hub")
-    st.markdown("Send direct emails or instant SMS notifications using your configured account keys.")
-    
-    comm_type = st.radio("Select Channel", ["Send Email", "Send SMS"])
-    
-    if comm_type == "Send Email":
-        dest_email = st.text_input("Recipient Email")
-        email_sub = st.text_input("Subject", value="Message from Trueman")
-        email_body = st.text_area("Email Message Body", height=150)
-        if st.button("Send Email Now", type="primary"):
-            success, msg = send_email_alert(smtp_email, smtp_password, dest_email, email_sub, email_body)
-            if success:
-                st.success(msg)
+    st.caption(
+        "Send an email or SMS with the accounts you add in the sidebar. "
+        "Nothing is stored, and you review each message before it goes."
+    )
+
+    comm_type = st.radio(
+        "Channel",
+        ["Send Email", "Send SMS"],
+        horizontal=True,
+        key="hub_channel",
+    )
+    channel = "email" if comm_type == "Send Email" else "sms"
+
+    sends_left = max(0, MAX_MESSAGES_PER_SESSION - st.session_state.send_count)
+    st.caption(f"{sends_left} messages left this session")
+
+    if channel == "email":
+        dest_email = st.text_input("Recipient email", key="hub_email_to")
+        email_sub = st.text_input(
+            "Subject",
+            value="Message from Trueman",
+            key="hub_email_subject",
+            max_chars=MAX_EMAIL_SUBJECT_CHARS,
+        )
+        email_body = st.text_area(
+            "Email message",
+            height=150,
+            key="hub_email_body",
+            max_chars=MAX_EMAIL_BODY_CHARS,
+        )
+        if st.button("Review email", type="primary", key="hub_review_email"):
+            if not validate_email_address(dest_email):
+                st.error("Enter one valid recipient email address.")
+            elif not email_body.strip():
+                st.error("Write a message first.")
             else:
-                st.error(msg)
-                
-    elif comm_type == "Send SMS":
-        dest_phone = st.text_input("Recipient Phone Number (with Country Code, e.g., +27...)")
-        sms_body = st.text_area("SMS Message (Keep under 160 characters for standard text)", height=100)
-        if st.button("Send SMS Now", type="primary"):
-            success, msg = send_sms_alert(twilio_sid, twilio_token, twilio_phone, dest_phone, sms_body)
-            if success:
-                st.success(msg)
+                st.session_state.pending_send = {
+                    "kind": "email",
+                    "to": dest_email.strip(),
+                    "subject": " ".join(email_sub.split())
+                    or "Message from Trueman",
+                    "body": email_body.strip(),
+                }
+    else:
+        dest_phone = st.text_input(
+            "Recipient phone (with country code, e.g. +27...)",
+            key="hub_sms_to",
+        )
+        sms_body = st.text_area(
+            "SMS message (under 160 characters is one text)",
+            height=100,
+            key="hub_sms_body",
+            max_chars=MAX_SMS_CHARS,
+        )
+        if st.button("Review SMS", type="primary", key="hub_review_sms"):
+            if not validate_phone_number(dest_phone):
+                st.error("Use the international format, e.g. +27821234567.")
+            elif not sms_body.strip():
+                st.error("Write a message first.")
             else:
-                st.error(msg)
+                st.session_state.pending_send = {
+                    "kind": "sms",
+                    "to": dest_phone.strip(),
+                    "body": sms_body.strip(),
+                }
+
+    pending = st.session_state.pending_send
+    if pending and pending["kind"] == channel:
+        st.info(f"Ready to send to **{pending['to']}**. Check it, then confirm.")
+        if channel == "email":
+            st.text(f"Subject: {pending['subject']}")
+        st.text(pending["body"])
+
+        confirm_clicked = st.button(
+            "✅ Confirm and send", type="primary", key="hub_confirm_send"
+        )
+        cancel_clicked = st.button("Cancel", key="hub_cancel_send")
+
+        if cancel_clicked:
+            st.session_state.pending_send = None
+            st.rerun()
+
+        if confirm_clicked:
+            blocked = send_limit_message()
+            if blocked:
+                st.error(blocked)
+            else:
+                record_send_attempt()
+                with st.spinner("Sending..."):
+                    if channel == "email":
+                        ok, result_message = send_email_alert(
+                            smtp_email,
+                            smtp_password,
+                            pending["to"],
+                            pending["subject"],
+                            pending["body"],
+                        )
+                    else:
+                        ok, result_message = send_sms_alert(
+                            twilio_sid,
+                            twilio_token,
+                            twilio_phone,
+                            pending["to"],
+                            pending["body"],
+                        )
+
+                if ok:
+                    st.session_state.pending_send = None
+                    st.success(result_message)
+                else:
+                    st.error(result_message)
 
 else:
-    # --- TRUEMAN CHAT & VOICE INTERFACE ---
+    # ---------------- Shared chat banner ----------------
     shared = st.session_state.shared_chat_payload
 
     if shared and shared.get("expired"):
@@ -1870,6 +2396,7 @@ else:
         )
 
 
+    # ---------------- Chat history ----------------
     messages = st.session_state.messages
 
     if not messages:
@@ -1882,6 +2409,12 @@ else:
                 on_click=queue_prompt_callback,
                 args=(suggestion,),
             )
+
+    if st.session_state.speak_message_index is not None:
+        speak_index = st.session_state.speak_message_index
+        st.session_state.speak_message_index = None
+        if 0 <= speak_index < len(messages):
+            render_speaker(messages[speak_index].get("text", ""), speak_index)
 
     last_index = len(messages) - 1
     last_user_index = max(
@@ -1949,6 +2482,17 @@ else:
                     )
 
             if role == "assistant" and not message.get("error"):
+                clip = st.session_state.voice_clip
+                if clip and clip["index"] == index:
+                    st.audio(
+                        clip["audio"],
+                        format="audio/mp3",
+                        autoplay=clip["autoplay"],
+                    )
+                    clip["autoplay"] = False
+                    if clip["truncated"]:
+                        st.caption("🔊 Read the first part aloud (long answers are shortened).")
+
                 if DEBUG and message.get("model"):
                     st.caption(
                         f"{message['model']} · {message.get('tokens', 0)} tokens"
@@ -1999,13 +2543,8 @@ else:
                             args=(followup,),
                         )
 
-    if st.session_state.speak_message_index is not None:
-        speak_index = st.session_state.speak_message_index
-        st.session_state.speak_message_index = None
-        if 0 <= speak_index < len(messages):
-            render_speaker(messages[speak_index].get("text", ""))
 
-
+    # ---------------- Generate a pending reply ----------------
     if st.session_state.run_pending:
         st.session_state.run_pending = False
 
@@ -2020,6 +2559,7 @@ else:
             st.rerun()
 
 
+    # ---------------- Input ----------------
     if st.session_state.force_send_attachment:
         st.session_state.force_send_attachment = False
         submit_user_message("")
@@ -2028,6 +2568,7 @@ else:
     if queued_prompt:
         st.session_state.queued_prompt = None
         submit_user_message(queued_prompt)
+
 
 # --- ALWAYS RENDER CHAT INPUT OUTSIDE CONDITIONAL BLOCKS ---
 if app_mode == "Trueman Chat":
