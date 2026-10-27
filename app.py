@@ -60,7 +60,9 @@ SUMMARY_TRIGGER_MESSAGES = 10
 SUMMARY_REFRESH_EVERY = 8
 FOLLOWUP_COUNT = 3
 
-MAX_ATTEMPTS_PER_MODEL = 3
+MAX_ATTEMPTS_PER_MODEL = 2
+REQUEST_TIMEOUT_MS = 60_000   # give up on a stuck model after 60 seconds
+AI_FOLLOWUPS = False          # True = ask the model for follow-ups (slower, uses quota)
 QUOTA_COOLDOWN_SECONDS = 90
 SHARE_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_ATTACHMENTS_IN_MEMORY = 2
@@ -83,9 +85,9 @@ MAX_SMS_CHARS = 480
 MODELS = list(
     dict.fromkeys(
         [
-            "gemini-3.8-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
             "gemini-flash-lite-latest",
             "gemini-flash-latest",
         ]
@@ -169,13 +171,11 @@ UNSUPPORTED_FILE = (
     "JSON, code, PDF, an image, or a common audio file."
 )
 
+# Timeouts are NOT retried: a stuck model should hand over to the next one.
 RETRYABLE_ERRORS = (
     "503",
     "unavailable",
     "overloaded",
-    "deadline",
-    "timeout",
-    "timed out",
     "internal",
 )
 
@@ -360,7 +360,10 @@ def get_client(api_key):
     if not api_key:
         return None
     try:
-        return genai.Client(api_key=api_key)
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+        )
     except Exception:
         return None
 
@@ -511,6 +514,8 @@ def record_request(
             "model": result.get("model"),
             "retries": result.get("retries", 0),
             "tokens": result.get("tokens", 0),
+            "first_word": result.get("first_word"),
+            "extra": 0.0,
             "ok": bool(result.get("ok")),
         }
     )
@@ -672,6 +677,7 @@ def stream_trueman(
     memory_context: str,
     active_client: Any,
 ):
+    stream_started = time.perf_counter()
     contents = build_contents(messages)
     config = build_config(
         chaos=chaos,
@@ -716,6 +722,8 @@ def stream_trueman(
                         text = ""
 
                     if text:
+                        if "first_word" not in result:
+                            result["first_word"] = time.perf_counter() - stream_started
                         yielded_text = True
                         yield text
 
@@ -1469,11 +1477,16 @@ def run_trueman(
             None,
         )
 
+        extras_started = time.perf_counter()
+
         if generate_followups_enabled and user_message:
-            # Save quota: only ask the model for follow-ups on substantial
-            # answers while we still have spare models. Otherwise use the
-            # free local suggestions.
-            use_model = len(reply) >= 200 and len(available_models()) >= 2
+            # Instant local suggestions by default. Only ask the model when
+            # AI_FOLLOWUPS is on, the answer is substantial and spare models exist.
+            use_model = (
+                AI_FOLLOWUPS
+                and len(reply) >= 200
+                and len(available_models()) >= 2
+            )
             message["followups"] = generate_followups(
                 user_message.get("text", ""),
                 reply,
@@ -1483,6 +1496,11 @@ def run_trueman(
             )
 
         maybe_update_summary(st.session_state.messages, active_client)
+
+        if st.session_state.telemetry:
+            st.session_state.telemetry[-1]["extra"] = (
+                time.perf_counter() - extras_started
+            )
 
 
 # ---------------- Messaging hub helpers (email / SMS) ----------------
@@ -2234,10 +2252,16 @@ with st.sidebar:
                 last = log[-1]
                 average = sum(item["elapsed"] for item in log) / len(log)
                 failed = sum(1 for item in log if not item["ok"])
+                first_word = last.get("first_word")
                 st.caption(
-                    f"Last: {last['elapsed']:.2f}s · "
+                    f"Last answer: {last['elapsed']:.2f}s · "
                     f"{last['model'] or 'no model'} · "
                     f"retries {last['retries']}"
+                )
+                st.caption(
+                    "First word after "
+                    + (f"{first_word:.2f}s" if first_word is not None else "n/a")
+                    + f" · follow-ups and summary {last.get('extra', 0.0):.2f}s"
                 )
                 st.caption(
                     f"Average {average:.2f}s over {len(log)} requests · "
